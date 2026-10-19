@@ -1,6 +1,6 @@
 [package]
 name = "airlock"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -32,6 +32,7 @@ hex = "0.4"
 url = "2.5"
 regex = "1.10"
 dunce = "1.0"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 
 [dev-dependencies]
 wiremock = "0.6"

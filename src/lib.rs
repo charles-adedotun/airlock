@@ -9,6 +9,7 @@ pub mod moov;
 pub mod range;
 pub mod ring;
 pub mod security;
+pub mod signals;
 pub mod storage;
 
 pub use engine::{
@@ -19,11 +20,15 @@ pub use engine::{
 pub use error::{
     AirlockError, IngestError, ProtocolError, SecurityError, StorageError, UpstreamError,
 };
-pub use ingest::{IngestState, StreamBufferSession, UpstreamHub, await_byte_offset};
+pub use ingest::{
+    GuardedBroadcastStream, IngestState, LiveBroadcastHub, LiveBroadcastSession,
+    LiveSubscriberGuard, StreamBufferSession, UpstreamHub, await_byte_offset,
+};
 pub use moov::{MoovProbeResult, fetch_tail_range, probe_mp4_boxes};
 pub use range::{HttpRange, ResolvedByteRange, parse_range_header, resolve_range};
 pub use ring::{LiveRingBuffer, RingChunk, RingStats};
 pub use security::{RedactedUrl, SafeDnsResolver, SafePathGuard, hash_stream_id};
+pub use signals::wait_for_shutdown_signal;
 pub use storage::{
     AsyncBufferedChunkWriter, DEFAULT_BUFFER_CAPACITY, DiskUsageInfo, EvictionPolicy,
     HostMemoryInfo, MIN_MEMORY_HEADROOM_BYTES, QuotaConfig, QuotaManager, SegmentId, SegmentMeta,

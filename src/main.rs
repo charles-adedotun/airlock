@@ -12,18 +12,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
 use airlock::engine::{LineupManager, create_lineup_router};
-use airlock::ingest::UpstreamHub;
+use airlock::ingest::{LiveBroadcastHub, UpstreamHub};
 use airlock::range::{HttpRange, parse_range_header, resolve_range};
-use airlock::security::SafePathGuard;
-use airlock::storage::{
-    QuotaConfig, SharedQuotaManager, check_host_memory_headroom, posix_fadvise_dontneed,
-};
+use airlock::security::{SafePathGuard, create_hardened_http_client};
+use airlock::signals::wait_for_shutdown_signal;
+use airlock::storage::{QuotaConfig, SharedQuotaManager, check_host_memory_headroom};
+#[cfg(unix)]
+use airlock::storage::posix_fadvise_dontneed_fd;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,6 +68,10 @@ struct Args {
     /// Target buffer latency for live sports in seconds
     #[arg(long, env = "AIRLOCK_SPORTS_LATENCY_SEC", default_value_t = 2.0)]
     sports_latency_sec: f64,
+
+    /// Allow private RFC 1918 and Tailscale CGNAT addresses for upstream tuners
+    #[arg(long, env = "AIRLOCK_ALLOW_PRIVATE_UPSTREAM", default_value_t = false)]
+    allow_private_upstream: bool,
 }
 
 #[derive(Clone)]
@@ -75,7 +79,7 @@ struct AppState {
     args: Arc<Args>,
     cache_dir: PathBuf,
     quota_manager: SharedQuotaManager,
-    upstream_hub: Arc<UpstreamHub>,
+    broadcast_hub: Arc<LiveBroadcastHub>,
     path_guard: Arc<SafePathGuard>,
     internal_client: reqwest::Client,
     outbound_client: reqwest::Client,
@@ -172,51 +176,22 @@ async fn serve_live_stream_internal(state: AppState, stream_id: String) -> Respo
         return (StatusCode::BAD_REQUEST, "Invalid stream_id").into_response();
     }
 
-    if let Err(err) = state.upstream_hub.switch_stream(&stream_id).await {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            format!("Upstream arbiter busy: {err}"),
-        )
-            .into_response();
-    }
-
-    let upstream_base = state.args.upstream.trim_end_matches('/');
-    let target_url = format!("{upstream_base}/live/airlock/proxy/{stream_id}.ts");
-
-    let hub = Arc::clone(&state.upstream_hub);
-    let sid = stream_id.clone();
-
-    match state.outbound_client.get(&target_url).send().await {
-        Ok(resp) => {
-            if !resp.status().is_success() {
-                hub.release(&sid).await;
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Upstream error: HTTP {}", resp.status()),
-                )
-                    .into_response();
-            }
-
-            let stream = resp.bytes_stream().map(move |chunk_res| {
-                chunk_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionReset, e))
-            });
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "video/mp2t")
-                .header(header::CACHE_CONTROL, "no-store")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(header::CONNECTION, "close")
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream response error").into_response()
-                })
-        }
+    match state.broadcast_hub.subscribe(&stream_id).await {
+        Ok(stream) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "video/mp2t")
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CONNECTION, "close")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Stream response error").into_response()
+            }),
         Err(err) => {
-            hub.release(&sid).await;
+            tracing::warn!(stream_id = %stream_id, error = %err, "Live stream subscription failed");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to connect to upstream: {err}"),
+                format!("Failed to connect to live stream: {err}"),
             )
                 .into_response()
         }
@@ -300,13 +275,15 @@ async fn serve_vod_internal(
             if let Ok(mut file) = tokio::fs::File::open(&final_path).await {
                 use tokio::io::{AsyncReadExt, AsyncSeekExt};
                 if file.seek(std::io::SeekFrom::Start(start)).await.is_ok() {
+                    // Advise Linux kernel to drop page cache for cold video data using existing raw FD
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let _ = posix_fadvise_dontneed_fd(file.as_raw_fd(), start as i64, length as i64);
+                    }
+
                     let take_file = tokio_util::io::ReaderStream::new(file.take(length));
                     let content_range = resolved.content_range_value();
-
-                    // Advise Linux kernel to drop page cache for cold video data
-                    if let Ok(std_f) = std::fs::File::open(&final_path) {
-                        let _ = posix_fadvise_dontneed(&std_f, start as i64, length as i64);
-                    }
 
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
@@ -463,9 +440,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let outbound_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
+    let outbound_client = create_hardened_http_client(args.allow_private_upstream)?;
+
+    let broadcast_hub = Arc::new(LiveBroadcastHub::new(
+        Arc::clone(&upstream_hub),
+        outbound_client.clone(),
+        args.upstream.clone(),
+        16 * 1024 * 1024,
+    ));
 
     let lineup_manager = Arc::new(LineupManager::new(
         format!("http://{}", args.listen),
@@ -477,7 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args: Arc::clone(&args),
         cache_dir: cache_dir.clone(),
         quota_manager,
-        upstream_hub,
+        broadcast_hub,
         path_guard,
         internal_client,
         outbound_client,
@@ -504,6 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog_upstream = %args.catalog_upstream,
         cache_dir = %cache_dir.display(),
         max_storage_gb = args.max_storage_gb,
+        allow_private_upstream = args.allow_private_upstream,
         "🚀 Airlock High-Throughput Streaming Engine initialized"
     );
 
@@ -513,12 +496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                tracing::error!(error = %err, "Failed to listen for shutdown signal");
-            }
-            info!("Shutting down Airlock streaming daemon...");
-        })
+        .with_graceful_shutdown(wait_for_shutdown_signal())
         .await?;
 
     Ok(())

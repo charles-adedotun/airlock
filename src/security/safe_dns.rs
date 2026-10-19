@@ -18,17 +18,24 @@ pub enum NetworkSecurityError {
 /// Evaluates whether an IP address belongs to internal, loopback, link-local,
 /// cloud metadata, multicast, or Tailscale CGNAT subnets.
 pub fn is_ip_restricted(ip: IpAddr) -> bool {
+    is_ip_restricted_with_policy(ip, false)
+}
+
+/// Evaluates whether an IP address is restricted based on an allow_private policy.
+/// When `allow_private` is true, RFC 1918 LAN and Tailscale CGNAT addresses are permitted,
+/// while loopback, cloud metadata (169.254.x.x), link-local, and multicast remain blocked.
+pub fn is_ip_restricted_with_policy(ip: IpAddr, allow_private: bool) -> bool {
     match ip {
-        IpAddr::V4(ipv4) => is_ipv4_restricted(ipv4),
-        IpAddr::V6(ipv6) => is_ipv6_restricted(ipv6),
+        IpAddr::V4(ipv4) => is_ipv4_restricted_with_policy(ipv4, allow_private),
+        IpAddr::V6(ipv6) => is_ipv6_restricted_with_policy(ipv6, allow_private),
     }
 }
 
-/// Checks an IPv4 address against restricted subnets.
-fn is_ipv4_restricted(ipv4: Ipv4Addr) -> bool {
+/// Checks an IPv4 address against restricted subnets with allow_private toggle.
+fn is_ipv4_restricted_with_policy(ipv4: Ipv4Addr, allow_private: bool) -> bool {
     let octets = ipv4.octets();
 
-    // 1. Loopback: 127.0.0.0/8
+    // 1. Loopback: 127.0.0.0/8 (always blocked)
     if ipv4.is_loopback() {
         return true;
     }
@@ -37,12 +44,12 @@ fn is_ipv4_restricted(ipv4: Ipv4Addr) -> bool {
     //    10.0.0.0/8
     //    172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
     //    192.168.0.0/16
-    if ipv4.is_private() {
+    if !allow_private && ipv4.is_private() {
         return true;
     }
 
     // 3. Link-Local / Cloud Metadata (AWS/GCP/Azure/OpenStack):
-    //    169.254.0.0/16 (e.g. 169.254.169.254)
+    //    169.254.0.0/16 (e.g. 169.254.169.254) (always blocked)
     if ipv4.is_link_local() {
         return true;
     }
@@ -50,7 +57,7 @@ fn is_ipv4_restricted(ipv4: Ipv4Addr) -> bool {
     // 4. Tailscale Carrier-Grade NAT (CGNAT) / RFC 6598 Shared Address Space:
     //    100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
     //    Binary check: first octet is 100, second octet top 2 bits are 01 (0b01xxxxxx = 64..127)
-    if octets[0] == 100 && (octets[1] & 0b1100_0000) == 64 {
+    if !allow_private && octets[0] == 100 && (octets[1] & 0b1100_0000) == 64 {
         return true;
     }
 
@@ -80,9 +87,9 @@ fn is_ipv4_restricted(ipv4: Ipv4Addr) -> bool {
     false
 }
 
-/// Checks an IPv6 address against restricted subnets.
-fn is_ipv6_restricted(ipv6: Ipv6Addr) -> bool {
-    // 1. Loopback (::1) and Unspecified (::)
+/// Checks an IPv6 address against restricted subnets with allow_private toggle.
+fn is_ipv6_restricted_with_policy(ipv6: Ipv6Addr, allow_private: bool) -> bool {
+    // 1. Loopback (::1) and Unspecified (::) (always blocked)
     if ipv6.is_loopback() || ipv6.is_unspecified() {
         return true;
     }
@@ -94,13 +101,13 @@ fn is_ipv6_restricted(ipv6: Ipv6Addr) -> bool {
 
     // 3. IPv4-Mapped IPv6 (::ffff:x.x.x.x)
     if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
-        return is_ipv4_restricted(mapped_v4);
+        return is_ipv4_restricted_with_policy(mapped_v4, allow_private);
     }
 
     let segments = ipv6.segments();
 
     // 4. Unique Local Addresses (ULA) fc00::/7 (RFC 4193, private IPv6)
-    if (segments[0] & 0xfe00) == 0xfc00 {
+    if !allow_private && (segments[0] & 0xfe00) == 0xfc00 {
         return true;
     }
 
@@ -128,16 +135,25 @@ fn is_ipv6_restricted(ipv6: Ipv6Addr) -> bool {
 /// internal networks, link-local, loopback, cloud metadata, or Tailscale CGNAT subnets.
 /// This prevents DNS rebinding and SSRF network pivoting.
 #[derive(Debug, Default, Clone)]
-pub struct SafeDnsResolver;
+pub struct SafeDnsResolver {
+    allow_private: bool,
+}
 
 impl SafeDnsResolver {
     pub fn new() -> Self {
-        Self
+        Self {
+            allow_private: false,
+        }
+    }
+
+    pub fn with_allow_private(allow_private: bool) -> Self {
+        Self { allow_private }
     }
 }
 
 impl Resolve for SafeDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
+        let allow_private = self.allow_private;
         Box::pin(async move {
             let host_str = name.as_str();
 
@@ -150,7 +166,7 @@ impl Resolve for SafeDnsResolver {
             let mut safe_addrs = Vec::new();
             for addr in addrs {
                 let ip = addr.ip();
-                if is_ip_restricted(ip) {
+                if is_ip_restricted_with_policy(ip, allow_private) {
                     tracing::warn!(
                         target: "security::ssrf",
                         host = host_str,
@@ -177,12 +193,13 @@ impl Resolve for SafeDnsResolver {
 
 /// Creates a security-hardened `reqwest::Client` configured with:
 /// - `SafeDnsResolver` blocking private, link-local, loopback, and Tailscale subnets.
+/// - Option to permit private homelab/Tailscale networks via `allow_private`.
 /// - Redirects disabled (`redirect::Policy::none()`) to prevent redirect-based SSRF.
 /// - Strict connection and read timeouts.
 /// - Rustls TLS backend.
-pub fn create_hardened_http_client() -> Result<Client, reqwest::Error> {
+pub fn create_hardened_http_client(allow_private: bool) -> Result<Client, reqwest::Error> {
     Client::builder()
-        .dns_resolver(Arc::new(SafeDnsResolver::new()))
+        .dns_resolver(Arc::new(SafeDnsResolver::with_allow_private(allow_private)))
         .redirect(redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
@@ -306,5 +323,28 @@ mod tests {
         let name = Name::from_str("localhost").unwrap();
         let res = resolver.resolve(name).await;
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_allow_private_policy() {
+        let lan_ip = IpAddr::from_str("192.168.1.50").unwrap();
+        let tailscale_ip = IpAddr::from_str("100.121.141.32").unwrap();
+        let rfc10_ip = IpAddr::from_str("10.0.1.1").unwrap();
+        let metadata_ip = IpAddr::from_str("169.254.169.254").unwrap();
+        let loopback_ip = IpAddr::from_str("127.0.0.1").unwrap();
+
+        // Default policy: restricted
+        assert!(is_ip_restricted(lan_ip));
+        assert!(is_ip_restricted(tailscale_ip));
+        assert!(is_ip_restricted(rfc10_ip));
+        assert!(is_ip_restricted(metadata_ip));
+        assert!(is_ip_restricted(loopback_ip));
+
+        // Allow private policy: LAN & Tailscale allowed, loopback & metadata still blocked
+        assert!(!is_ip_restricted_with_policy(lan_ip, true));
+        assert!(!is_ip_restricted_with_policy(tailscale_ip, true));
+        assert!(!is_ip_restricted_with_policy(rfc10_ip, true));
+        assert!(is_ip_restricted_with_policy(metadata_ip, true));
+        assert!(is_ip_restricted_with_policy(loopback_ip, true));
     }
 }

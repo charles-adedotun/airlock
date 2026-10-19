@@ -208,3 +208,291 @@ impl UpstreamHub {
         }
     }
 }
+
+use crate::engine::TsStreamRing;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+/// An active shared live broadcast session.
+pub struct LiveBroadcastSession {
+    pub stream_id: String,
+    pub ts_ring: Arc<TsStreamRing>,
+    pub broadcast_tx: broadcast::Sender<Bytes>,
+    pub subscribers: Arc<AtomicUsize>,
+    pub abort_handle: tokio::task::AbortHandle,
+    pub created_at: Instant,
+}
+
+/// RAII Drop Guard for an active subscriber to a live broadcast session.
+/// Decrements the subscriber count on drop and triggers debounced session teardown
+/// when the last client disconnects.
+pub struct LiveSubscriberGuard {
+    sessions: Arc<Mutex<HashMap<String, Arc<LiveBroadcastSession>>>>,
+    upstream_hub: Arc<UpstreamHub>,
+    stream_id: String,
+    active: bool,
+}
+
+impl LiveSubscriberGuard {
+    pub fn new(
+        sessions: Arc<Mutex<HashMap<String, Arc<LiveBroadcastSession>>>>,
+        upstream_hub: Arc<UpstreamHub>,
+        stream_id: String,
+    ) -> Self {
+        Self {
+            sessions,
+            upstream_hub,
+            stream_id,
+            active: true,
+        }
+    }
+}
+
+impl Drop for LiveSubscriberGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let sessions = Arc::clone(&self.sessions);
+            let hub = Arc::clone(&self.upstream_hub);
+            let sid = self.stream_id.clone();
+            tokio::spawn(async move {
+                let mut should_teardown = false;
+                {
+                    let map = sessions.lock().await;
+                    if let Some(session) = map.get(&sid) {
+                        let prev = session.subscribers.fetch_sub(1, Ordering::SeqCst);
+                        if prev <= 1 {
+                            should_teardown = true;
+                        }
+                    }
+                }
+
+                if should_teardown {
+                    // Grace debounce period (1500ms) before terminating upstream socket
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let mut map = sessions.lock().await;
+                    if let Some(session) = map.get(&sid) {
+                        if session.subscribers.load(Ordering::SeqCst) == 0 {
+                            if let Some(removed) = map.remove(&sid) {
+                                removed.abort_handle.abort();
+                                hub.release(&sid).await;
+                                tracing::info!(stream_id = %sid, "Live broadcast session torn down cleanly after last client disconnected");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Stream wrapper pairing an in-flight byte stream with an RAII `LiveSubscriberGuard`.
+pub struct GuardedBroadcastStream<S> {
+    stream: S,
+    _guard: LiveSubscriberGuard,
+}
+
+impl<S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin> futures_util::Stream
+    for GuardedBroadcastStream<S>
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.stream).poll_next(cx)
+    }
+}
+
+/// Shared coordinator for in-flight live IPTV broadcast sessions.
+pub struct LiveBroadcastHub {
+    upstream_hub: Arc<UpstreamHub>,
+    sessions: Arc<Mutex<HashMap<String, Arc<LiveBroadcastSession>>>>,
+    outbound_client: reqwest::Client,
+    upstream_base_url: String,
+    ring_capacity: usize,
+}
+
+impl LiveBroadcastHub {
+    pub fn new(
+        upstream_hub: Arc<UpstreamHub>,
+        outbound_client: reqwest::Client,
+        upstream_base_url: String,
+        ring_capacity: usize,
+    ) -> Self {
+        Self {
+            upstream_hub,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            outbound_client,
+            upstream_base_url,
+            ring_capacity,
+        }
+    }
+
+    /// Subscribe to a live stream.
+    /// If an active session already exists for `stream_id`, attaches to the existing stream
+    /// without opening a new upstream socket (fan-out). If new, initiates single upstream
+    /// ingest task through `TsStreamRing`.
+    pub async fn subscribe(
+        &self,
+        stream_id: &str,
+    ) -> Result<
+        GuardedBroadcastStream<
+            Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        >,
+        UpstreamError,
+    > {
+        let mut map = self.sessions.lock().await;
+
+        if let Some(session) = map.get(stream_id) {
+            // Channel already playing: attach to existing broadcast session!
+            session.subscribers.fetch_add(1, Ordering::SeqCst);
+            let rx = session.broadcast_tx.subscribe();
+            let burst = session
+                .ts_ring
+                .get_zapping_burst()
+                .ok()
+                .filter(|b| !b.is_empty());
+
+            let live_stream = BroadcastStream::new(rx).filter_map(|res| async move {
+                match res {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "Subscriber lagged in live broadcast, skipping ahead");
+                        None
+                    }
+                }
+            });
+
+            let combined_stream: Pin<
+                Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+            > = match burst {
+                Some(b) => Box::pin(futures_util::stream::once(async move { Ok(b) }).chain(live_stream)),
+                None => Box::pin(live_stream),
+            };
+
+            let guard = LiveSubscriberGuard::new(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.upstream_hub),
+                stream_id.to_string(),
+            );
+
+            tracing::info!(
+                stream_id = %stream_id,
+                subscribers = session.subscribers.load(Ordering::SeqCst),
+                "Attached new subscriber to existing in-flight broadcast session"
+            );
+
+            return Ok(GuardedBroadcastStream {
+                stream: combined_stream,
+                _guard: guard,
+            });
+        }
+
+        // Acquire arbiter lock (enforces single connection invariant and cooldown)
+        self.upstream_hub.switch_stream(stream_id).await?;
+
+        let upstream_base = self.upstream_base_url.trim_end_matches('/');
+        let target_url = format!("{upstream_base}/live/airlock/proxy/{stream_id}.ts");
+
+        let resp = match self.outbound_client.get(&target_url).send().await {
+            Ok(r) => {
+                if !r.status().is_success() {
+                    self.upstream_hub.release(stream_id).await;
+                    return Err(UpstreamError::UpstreamStatusError {
+                        status: r.status().as_u16(),
+                    });
+                }
+                r
+            }
+            Err(e) => {
+                self.upstream_hub.release(stream_id).await;
+                return Err(UpstreamError::ConnectionFailed(e.to_string()));
+            }
+        };
+
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(256);
+        let ts_ring = Arc::new(TsStreamRing::new(self.ring_capacity));
+        let subscribers = Arc::new(AtomicUsize::new(1));
+
+        let ring_clone = Arc::clone(&ts_ring);
+        let tx_clone = broadcast_tx.clone();
+        let sid = stream_id.to_string();
+        let mut byte_stream = resp.bytes_stream();
+
+        let join_handle = tokio::spawn(async move {
+            while let Some(chunk_res) = byte_stream.next().await {
+                match chunk_res {
+                    Ok(chunk) => {
+                        // Ingest into TsStreamRing (synchronizes 188B packets, indexes IDR)
+                        let _ = ring_clone.ingest_raw(&chunk);
+                        // Broadcast chunk to all connected downstreams
+                        let _ = tx_clone.send(chunk);
+                    }
+                    Err(err) => {
+                        tracing::warn!(stream_id = %sid, error = %err, "Upstream live stream closed or reset");
+                        break;
+                    }
+                }
+            }
+            tracing::info!(stream_id = %sid, "Upstream ingest task completed");
+        });
+
+        let session = Arc::new(LiveBroadcastSession {
+            stream_id: stream_id.to_string(),
+            ts_ring,
+            broadcast_tx,
+            subscribers,
+            abort_handle: join_handle.abort_handle(),
+            created_at: Instant::now(),
+        });
+
+        map.insert(stream_id.to_string(), session);
+
+        let live_stream = BroadcastStream::new(broadcast_rx).filter_map(|res| async move {
+            match res {
+                Ok(chunk) => Some(Ok(chunk)),
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "Subscriber lagged in live broadcast, skipping ahead");
+                    None
+                }
+            }
+        });
+
+        let boxed_stream: Pin<
+            Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+        > = Box::pin(live_stream);
+
+        let guard = LiveSubscriberGuard::new(
+            Arc::clone(&self.sessions),
+            Arc::clone(&self.upstream_hub),
+            stream_id.to_string(),
+        );
+
+        tracing::info!(
+            stream_id = %stream_id,
+            "Spawned new live broadcast session and single upstream worker"
+        );
+
+        Ok(GuardedBroadcastStream {
+            stream: boxed_stream,
+            _guard: guard,
+        })
+    }
+
+    /// Number of active broadcast sessions.
+    pub async fn active_sessions_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// Number of active subscribers for a given stream.
+    pub async fn subscribers_count(&self, stream_id: &str) -> usize {
+        let map = self.sessions.lock().await;
+        map.get(stream_id)
+            .map(|s| s.subscribers.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}

@@ -9,6 +9,8 @@ pub use memory_watchdog::{
     check_host_memory_headroom_with_threshold, get_host_available_memory_bytes,
     get_host_memory_info,
 };
+#[cfg(unix)]
+pub use page_cache::posix_fadvise_dontneed_fd;
 pub use page_cache::{posix_fadvise_dontneed, preallocate_file, preallocate_file_with_path};
 pub use quota::{
     DiskUsageInfo, EvictionPolicy, QuotaConfig, QuotaManager, SegmentId, SegmentMeta,

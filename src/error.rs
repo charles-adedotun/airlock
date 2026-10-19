@@ -136,6 +136,12 @@ pub enum UpstreamError {
 
     #[error("Upstream provider unreachable")]
     ProviderUnreachable,
+
+    #[error("Upstream connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("Upstream returned HTTP error status: {status}")]
+    UpstreamStatusError { status: u16 },
 }
 
 /// Top-level unified domain error for the airlock streaming daemon.

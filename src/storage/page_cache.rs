@@ -7,12 +7,27 @@ use tokio::fs::File as TokioFile;
 /// Cross-platform: uses `posix_fadvise` with `POSIX_FADV_DONTNEED` on Linux,
 /// and is a safe no-op on macOS and other platforms.
 pub fn posix_fadvise_dontneed(file: &File, offset: i64, len: i64) -> IoResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        posix_fadvise_dontneed_fd(file.as_raw_fd(), offset, len)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, offset, len);
+        Ok(())
+    }
+}
+
+/// Drops pages from the OS page cache using a raw file descriptor directly.
+/// Eliminates redundant `File::open` calls for callers already holding an open file descriptor.
+#[cfg(unix)]
+pub fn posix_fadvise_dontneed_fd(fd: std::os::unix::io::RawFd, offset: i64, len: i64) -> IoResult<()> {
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
-        use std::os::unix::io::AsRawFd;
         posix_fadvise(
-            file.as_raw_fd(),
+            fd,
             offset as libc::off_t,
             len as libc::off_t,
             PosixFadviseAdvice::POSIX_FADV_DONTNEED,
@@ -21,7 +36,7 @@ pub fn posix_fadvise_dontneed(file: &File, offset: i64, len: i64) -> IoResult<()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (file, offset, len);
+        let _ = (fd, offset, len);
     }
     Ok(())
 }

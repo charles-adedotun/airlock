@@ -56,6 +56,7 @@ cargo build --release
 | `--max-storage-gb` | `AIRLOCK_MAX_STORAGE_GB` | `100` | Rolling cache ceiling (50–200 GB) |
 | `--min-disk-free-gb` | `AIRLOCK_MIN_DISK_FREE_GB` | `10` | Emergency free disk floor |
 | `--sports-latency-sec` | `AIRLOCK_SPORTS_LATENCY_SEC` | `2.0` | Target live sports latency |
+| `--allow-private-upstream` | `AIRLOCK_ALLOW_PRIVATE_UPSTREAM` | `false` | Permit RFC 1918 / Tailscale upstream tuners |
 
 ---
 
