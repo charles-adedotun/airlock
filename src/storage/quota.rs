@@ -362,6 +362,15 @@ impl SharedQuotaManager {
         lock.config.emergency_disk_floor_bytes = min_free_bytes;
     }
 
+    /// Returns the current quota limits as (max_storage_gb, min_disk_free_gb).
+    pub async fn current_limits(&self) -> (u64, u64) {
+        let lock = self.inner.read().await;
+        (
+            lock.config.max_cache_bytes / (1024 * 1024 * 1024),
+            lock.config.emergency_disk_floor_bytes / (1024 * 1024 * 1024),
+        )
+    }
+
     pub async fn usage_info(&self, cache_dir: &Path) -> Result<DiskUsageInfo, StorageError> {
         let available_disk = QuotaManager::get_available_disk_space(cache_dir)?;
         let lock = self.inner.read().await;

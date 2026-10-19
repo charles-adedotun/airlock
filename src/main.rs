@@ -110,6 +110,7 @@ async fn healthz_handler() -> impl IntoResponse {
 
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let usage = state.quota_manager.usage_info(&state.cache_dir).await.ok();
+    let (max_storage_gb, min_disk_free_gb) = state.quota_manager.current_limits().await;
     Json(json!({
         "service": "airlock",
         "version": env!("CARGO_PKG_VERSION"),
@@ -119,8 +120,8 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         "storage": {
             "cache_dir": state.cache_dir.display().to_string(),
             "usage": usage,
-            "max_storage_gb": state.config.storage.max_storage_gb,
-            "min_disk_free_gb": state.config.storage.min_disk_free_gb
+            "max_storage_gb": max_storage_gb,
+            "min_disk_free_gb": min_disk_free_gb
         },
         "live_streaming": {
             "sports_target_latency_sec": state.config.streaming.sports_latency_sec,
