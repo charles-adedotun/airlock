@@ -200,20 +200,60 @@ impl LineupManager {
 
 // Axum Route Handlers
 
-async fn handle_discover(State(manager): State<Arc<LineupManager>>) -> Json<DiscoverConfig> {
-    Json(manager.get_discover_json())
+async fn handle_discover(
+    headers: HeaderMap,
+    State(manager): State<Arc<LineupManager>>,
+) -> Json<DiscoverConfig> {
+    let mut config = manager.get_discover_json();
+    if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        if config.base_url.contains("://0.0.0.0:") {
+            let schema = if config.base_url.starts_with("https://") { "https://" } else { "http://" };
+            config.base_url = format!("{}{}", schema, host);
+            config.lineup_url = format!("{}{}/lineup.json", schema, host);
+        }
+    }
+    Json(config)
 }
 
 async fn handle_lineup_status(State(manager): State<Arc<LineupManager>>) -> Json<LineupStatus> {
     Json(manager.get_lineup_status_json())
 }
 
-async fn handle_lineup(State(manager): State<Arc<LineupManager>>) -> Json<Vec<ChannelEntry>> {
-    Json(manager.get_lineup_json())
+async fn handle_lineup(
+    headers: HeaderMap,
+    State(manager): State<Arc<LineupManager>>,
+) -> Json<Vec<ChannelEntry>> {
+    let mut channels = manager.get_lineup_json();
+    if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        for ch in &mut channels {
+            if ch.stream_url.contains("://0.0.0.0:") {
+                let schema = if ch.stream_url.starts_with("https://") { "https://" } else { "http://" };
+                let rest = &ch.stream_url[schema.len()..];
+                if let Some(slash_idx) = rest.find('/') {
+                    ch.stream_url = format!("{}{}{}", schema, host, &rest[slash_idx..]);
+                }
+            }
+        }
+    }
+    Json(channels)
 }
 
-async fn handle_device_xml(State(manager): State<Arc<LineupManager>>) -> Response {
-    let xml = manager.generate_device_xml();
+async fn handle_device_xml(
+    headers: HeaderMap,
+    State(manager): State<Arc<LineupManager>>,
+) -> Response {
+    let mut xml = manager.generate_device_xml();
+    if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        if xml.contains("://0.0.0.0:") {
+            let schema = if xml.contains("https://0.0.0.0:") { "https://" } else { "http://" };
+            if let Some(start) = xml.find(&format!("{}0.0.0.0:", schema)) {
+                if let Some(end) = xml[start..].find("</URLBase>") {
+                    let full_tag = &xml[start..start + end];
+                    xml = xml.replace(full_tag, &format!("{}{}", schema, host));
+                }
+            }
+        }
+    }
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -222,8 +262,32 @@ async fn handle_device_xml(State(manager): State<Arc<LineupManager>>) -> Respons
     (StatusCode::OK, headers, xml).into_response()
 }
 
-async fn handle_playlist_m3u(State(manager): State<Arc<LineupManager>>) -> Response {
-    let m3u = manager.generate_m3u_playlist();
+async fn handle_playlist_m3u(
+    headers: HeaderMap,
+    State(manager): State<Arc<LineupManager>>,
+) -> Response {
+    let mut m3u = manager.generate_m3u_playlist();
+    if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        if m3u.contains("://0.0.0.0:") {
+            let mut result = String::with_capacity(m3u.len());
+            for line in m3u.lines() {
+                if line.contains("://0.0.0.0:") {
+                    let schema = if line.starts_with("https://") { "https://" } else { "http://" };
+                    let rest = &line[schema.len()..];
+                    if let Some(slash_idx) = rest.find('/') {
+                        result.push_str(schema);
+                        result.push_str(host);
+                        result.push_str(&rest[slash_idx..]);
+                        result.push('\n');
+                        continue;
+                    }
+                }
+                result.push_str(line);
+                result.push('\n');
+            }
+            m3u = result;
+        }
+    }
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
