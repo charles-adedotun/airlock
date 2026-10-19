@@ -22,7 +22,11 @@ pub fn posix_fadvise_dontneed(file: &File, offset: i64, len: i64) -> IoResult<()
 /// Drops pages from the OS page cache using a raw file descriptor directly.
 /// Eliminates redundant `File::open` calls for callers already holding an open file descriptor.
 #[cfg(unix)]
-pub fn posix_fadvise_dontneed_fd(fd: std::os::unix::io::RawFd, offset: i64, len: i64) -> IoResult<()> {
+pub fn posix_fadvise_dontneed_fd(
+    fd: std::os::unix::io::RawFd,
+    offset: i64,
+    len: i64,
+) -> IoResult<()> {
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};

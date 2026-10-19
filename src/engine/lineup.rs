@@ -94,6 +94,11 @@ impl LineupManager {
         }
     }
 
+    /// Get the base host URL configured for this lineup manager.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Add a channel to the virtual lineup.
     pub fn add_channel(&self, channel: ChannelEntry) {
         if let Ok(mut lock) = self.channels.write() {

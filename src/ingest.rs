@@ -361,7 +361,10 @@ impl LiveBroadcastHub {
                 match res {
                     Ok(chunk) => Some(Ok(chunk)),
                     Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "Subscriber lagged in live broadcast, skipping ahead");
+                        tracing::warn!(
+                            skipped,
+                            "Subscriber lagged in live broadcast, skipping ahead"
+                        );
                         None
                     }
                 }
@@ -370,7 +373,9 @@ impl LiveBroadcastHub {
             let combined_stream: Pin<
                 Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
             > = match burst {
-                Some(b) => Box::pin(futures_util::stream::once(async move { Ok(b) }).chain(live_stream)),
+                Some(b) => {
+                    Box::pin(futures_util::stream::once(async move { Ok(b) }).chain(live_stream))
+                }
                 None => Box::pin(live_stream),
             };
 
@@ -456,7 +461,10 @@ impl LiveBroadcastHub {
             match res {
                 Ok(chunk) => Some(Ok(chunk)),
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "Subscriber lagged in live broadcast, skipping ahead");
+                    tracing::warn!(
+                        skipped,
+                        "Subscriber lagged in live broadcast, skipping ahead"
+                    );
                     None
                 }
             }
@@ -494,5 +502,10 @@ impl LiveBroadcastHub {
         map.get(stream_id)
             .map(|s| s.subscribers.load(Ordering::SeqCst))
             .unwrap_or(0)
+    }
+
+    /// Retrieve the active broadcast session for a stream if in-flight.
+    pub async fn get_session(&self, stream_id: &str) -> Option<Arc<LiveBroadcastSession>> {
+        self.sessions.lock().await.get(stream_id).cloned()
     }
 }

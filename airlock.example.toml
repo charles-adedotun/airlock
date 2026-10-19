@@ -1,0 +1,19 @@
+# airlock 🛡️ Configuration Template
+# Place at ./airlock.toml or /etc/airlock/airlock.toml
+
+[server]
+listen = "0.0.0.0:8795"
+upstream = "http://line.ottcst.org"
+catalog_upstream = "http://127.0.0.1:8794"
+allow_private_upstream = false
+
+[storage]
+cache_dir = "~/.cache/airlock/media"
+max_storage_gb = 100
+min_disk_free_gb = 10
+segment_duration_secs = 300
+
+[streaming]
+sports_latency_sec = 2.0
+conflict_policy = "reject" # "reject" (HTTP 409 unless ?force=1) | "preempt" (auto-switch)
+timeshift_max_hours = 2

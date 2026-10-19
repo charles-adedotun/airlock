@@ -24,6 +24,7 @@ dependencies = [
  "hex",
  "libc",
  "nix",
+ "parking_lot",
  "regex",
  "reqwest",
  "serde",

@@ -144,9 +144,14 @@ pub enum UpstreamError {
     UpstreamStatusError { status: u16 },
 }
 
+pub use crate::config::ConfigError;
+
 /// Top-level unified domain error for the airlock streaming daemon.
 #[derive(Debug, Error)]
 pub enum AirlockError {
+    #[error("Configuration error: {0}")]
+    Config(#[from] ConfigError),
+
     #[error("Ingest error: {0}")]
     Ingest(#[from] IngestError),
 
@@ -162,12 +167,19 @@ pub enum AirlockError {
     #[error("Upstream error: {0}")]
     Upstream(#[from] UpstreamError),
 
+    #[error("Channel conflict: {0}")]
+    Conflict(#[from] crate::arbiter::ConflictError),
+
     #[error("Internal service error: {0}")]
     Internal(String),
 }
 
 impl axum::response::IntoResponse for AirlockError {
     fn into_response(self) -> axum::response::Response {
+        if let AirlockError::Conflict(ref err) = self {
+            return err.to_response();
+        }
+
         use axum::http::StatusCode;
         let (status, message) = match &self {
             AirlockError::Protocol(ProtocolError::RangeNotSatisfiable { .. }) => {
