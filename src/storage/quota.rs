@@ -353,6 +353,15 @@ impl SharedQuotaManager {
         lock.remove_segment(id)
     }
 
+    /// Update storage quota configuration at runtime.
+    pub async fn update_quota(&self, max_storage_gb: u64, min_disk_free_gb: u64) {
+        let mut lock = self.inner.write().await;
+        let max_bytes = max_storage_gb.clamp(10, 500) * 1024 * 1024 * 1024;
+        let min_free_bytes = min_disk_free_gb * 1024 * 1024 * 1024;
+        lock.config.max_cache_bytes = max_bytes;
+        lock.config.emergency_disk_floor_bytes = min_free_bytes;
+    }
+
     pub async fn usage_info(&self, cache_dir: &Path) -> Result<DiskUsageInfo, StorageError> {
         let available_disk = QuotaManager::get_available_disk_space(cache_dir)?;
         let lock = self.inner.read().await;

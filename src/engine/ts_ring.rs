@@ -315,6 +315,76 @@ pub fn extract_video_pid_from_pmt(packet: &[u8]) -> Option<u16> {
     None
 }
 
+/// Extract all elementary audio stream PIDs from a Program Map Table (PMT) packet.
+/// Supports MPEG-1 Audio (0x03), MPEG-2 Audio (0x04), AAC ADTS (0x0F), LATM AAC (0x11),
+/// Dolby AC-3 (0x81), and Enhanced AC-3 / Dolby Digital Plus (0x87).
+pub fn extract_audio_pids_from_pmt(packet: &[u8]) -> Vec<u16> {
+    if packet.len() != TS_PACKET_SIZE || packet[0] != TS_SYNC_BYTE {
+        return Vec::new();
+    }
+
+    let pusi = (packet[1] & 0x40) != 0;
+    let afc = (packet[3] >> 4) & 0x03;
+    let mut offset = 4;
+    if afc == 0b10 || afc == 0b11 {
+        let af_len = packet[4] as usize;
+        offset = 5 + af_len;
+    }
+    if offset >= TS_PACKET_SIZE {
+        return Vec::new();
+    }
+
+    if pusi {
+        let pointer = packet[offset] as usize;
+        offset += 1 + pointer;
+    }
+
+    if offset + 12 > TS_PACKET_SIZE {
+        return Vec::new();
+    }
+
+    let table_id = packet[offset];
+    if table_id != 0x02 {
+        return Vec::new(); // Not PMT
+    }
+
+    let section_len = (((packet[offset + 1] & 0x0F) as usize) << 8) | (packet[offset + 2] as usize);
+    let prog_info_len =
+        (((packet[offset + 10] & 0x0F) as usize) << 8) | (packet[offset + 11] as usize);
+
+    let mut es_idx = offset + 12 + prog_info_len;
+    let section_end = (offset + 3 + section_len).min(TS_PACKET_SIZE - 4);
+    let mut audio_pids = Vec::new();
+
+    while es_idx + 5 <= section_end {
+        let stream_type = packet[es_idx];
+        let elem_pid = (((packet[es_idx + 1] & 0x1F) as u16) << 8) | (packet[es_idx + 2] as u16);
+        let es_info_len =
+            (((packet[es_idx + 3] & 0x0F) as usize) << 8) | (packet[es_idx + 4] as usize);
+
+        // Standard MPEG audio stream types:
+        // 0x03 = ISO/IEC 11172-3 Audio (MPEG-1 Audio)
+        // 0x04 = ISO/IEC 13818-3 Audio (MPEG-2 Audio)
+        // 0x0F = ISO/IEC 13818-7 Audio with ADTS (AAC)
+        // 0x11 = ISO/IEC 14496-3 Audio with LATM (AAC)
+        // 0x81 = Dolby AC-3 Audio
+        // 0x87 = Enhanced AC-3 / Dolby Digital Plus Audio
+        if stream_type == 0x03
+            || stream_type == 0x04
+            || stream_type == 0x0F
+            || stream_type == 0x11
+            || stream_type == 0x81
+            || stream_type == 0x87
+        {
+            audio_pids.push(elem_pid);
+        }
+
+        es_idx += 5 + es_info_len;
+    }
+
+    audio_pids
+}
+
 /// Thread-safe MPEG-TS streaming ring buffer with sub-second zapping burst generation.
 pub struct TsStreamRing {
     ring: LiveRingBuffer,
@@ -328,6 +398,7 @@ struct TsStreamState {
     cached_sps_pps: Vec<Bytes>,
     pmt_pid: Option<u16>,
     video_pid: Option<u16>,
+    audio_pids: Vec<u16>,
     latest_idr_seq: Option<u64>,
 }
 
@@ -343,9 +414,15 @@ impl TsStreamRing {
                 cached_sps_pps: Vec::new(),
                 pmt_pid: None,
                 video_pid: None,
+                audio_pids: Vec::new(),
                 latest_idr_seq: None,
             }),
         }
+    }
+
+    /// Retrieve currently identified elementary audio PIDs from cached PMT.
+    pub fn audio_pids(&self) -> Vec<u16> {
+        self.state.read().map(|s| s.audio_pids.clone()).unwrap_or_default()
     }
 
     /// Push raw chunks into the synchronizer, parse TS packets, index keyframes,
@@ -371,6 +448,7 @@ impl TsStreamRing {
                     if let Some(v_pid) = extract_video_pid_from_pmt(&packet) {
                         state.video_pid = Some(v_pid);
                     }
+                    state.audio_pids = extract_audio_pids_from_pmt(&packet);
                     state.cached_pmt = Some(packet.clone());
                 }
 

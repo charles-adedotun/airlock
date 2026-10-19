@@ -122,11 +122,42 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
             "max_storage_gb": state.config.storage.max_storage_gb,
             "min_disk_free_gb": state.config.storage.min_disk_free_gb
         },
+        "live_streaming": {
+            "sports_target_latency_sec": state.config.streaming.sports_latency_sec,
+            "catchup_slew_rate": 1.05,
+            "conflict_policy": state.config.streaming.conflict_policy.to_string(),
+            "active_broadcast_sessions": state.broadcast_hub.active_sessions_count().await,
+            "active_stream_id": state.arbiter.active_stream(),
+            "active_subscribers": state.arbiter.active_subscribers()
+        },
         "sports_target_latency_sec": state.config.streaming.sports_latency_sec,
         "conflict_policy": state.config.streaming.conflict_policy.to_string(),
         "active_broadcast_sessions": state.broadcast_hub.active_sessions_count().await,
         "host_memory_headroom_ok": check_host_memory_headroom()
     }))
+}
+
+#[derive(Deserialize, Debug)]
+struct UpdateQuotaPayload {
+    max_storage_gb: Option<u64>,
+    min_disk_free_gb: Option<u64>,
+}
+
+async fn update_quota_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateQuotaPayload>,
+) -> impl IntoResponse {
+    let max_gb = payload.max_storage_gb.unwrap_or(state.config.storage.max_storage_gb);
+    let min_free_gb = payload.min_disk_free_gb.unwrap_or(state.config.storage.min_disk_free_gb);
+    state.quota_manager.update_quota(max_gb, min_free_gb).await;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "max_storage_gb": max_gb,
+            "min_disk_free_gb": min_free_gb
+        })),
+    )
 }
 
 // Live Stream Handlers
@@ -183,6 +214,9 @@ async fn serve_live_stream_internal(state: AppState, stream_id: String, force: b
                 .header(header::CONTENT_TYPE, "video/mp2t")
                 .header(header::CACHE_CONTROL, "no-store")
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header("X-Airlock-Live-Lag-Sec", format!("{:.2}", state.config.streaming.sports_latency_sec))
+                .header("X-Airlock-Sports-Target-Sec", format!("{:.2}", state.config.streaming.sports_latency_sec))
+                .header("X-Airlock-Catchup-Slew-Rate", "1.05")
                 .header(header::CONNECTION, "close")
                 .body(axum::body::Body::from_stream(guarded))
                 .unwrap_or_else(|_| {
@@ -535,6 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz_handler))
         .route("/api/healthz", get(healthz_handler))
         .route("/api/status", get(status_handler))
+        .route("/api/storage/quota", axum::routing::post(update_quota_handler))
         // Raw TS Streaming routes
         .route("/live/:user/:pass/:target", get(handle_live_xtream))
         .route("/api/stream/live", get(handle_live_query))

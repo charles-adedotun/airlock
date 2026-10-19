@@ -15,5 +15,6 @@ pub use slew::{AdaptiveSlewController, SlewAction};
 pub use timeshift::{TimeshiftConfig, TimeshiftRecorder, TimeshiftSegment};
 pub use ts_ring::{
     MpegTsSynchronizer, TS_PACKET_SIZE, TS_SYNC_BYTE, TsPacketMeta, TsStreamRing,
-    extract_pmt_pid_from_pat, extract_video_pid_from_pmt, parse_ts_packet,
+    extract_audio_pids_from_pmt, extract_pmt_pid_from_pat, extract_video_pid_from_pmt,
+    parse_ts_packet,
 };

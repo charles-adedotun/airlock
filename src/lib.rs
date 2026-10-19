@@ -24,8 +24,8 @@ pub use engine::{
     AdaptiveSlewController, CANDIDATE_ENDPOINTS, CatalogSyncManager, ChannelEntry, DiscoverConfig,
     HlsPlaylistGenerator, HlsSegment, HlsVariant, LineupManager, LineupStatus, MpegTsSynchronizer,
     SlewAction, TS_PACKET_SIZE, TS_SYNC_BYTE, TimeshiftConfig, TimeshiftRecorder, TimeshiftSegment,
-    TsPacketMeta, TsStreamRing, create_lineup_router, extract_pmt_pid_from_pat,
-    extract_video_pid_from_pmt, parse_catalog_channels, parse_ts_packet,
+    TsPacketMeta, TsStreamRing, create_lineup_router, extract_audio_pids_from_pmt,
+    extract_pmt_pid_from_pat, extract_video_pid_from_pmt, parse_catalog_channels, parse_ts_packet,
 };
 pub use error::{
     AirlockError, IngestError, ProtocolError, SecurityError, StorageError, UpstreamError,
