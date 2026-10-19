@@ -17,8 +17,8 @@ use crate::error::{AirlockError, IngestError};
 
 /// Default candidate endpoints checked when syncing from a catalog base URL.
 pub const CANDIDATE_ENDPOINTS: &[&str] = &[
-    "/api/entertainment/channels",
     "/api/entertainment/hub",
+    "/api/entertainment/channels",
     "/player_api.php?action=get_live_streams",
 ];
 
@@ -117,7 +117,20 @@ impl CatalogSyncManager {
                                     "Failed to parse catalog JSON from {target_url}: {e}"
                                 ))
                             })?;
-                        return self.apply_catalog_json(&json_val);
+                        // If endpoint returned an error object (e.g. {"error": "not found"} with HTTP 200), try next candidate
+                        if json_val.get("error").is_some()
+                            && json_val.get("curated_live_tv").is_none()
+                            && json_val.get("items").is_none()
+                            && json_val.get("channels").is_none()
+                        {
+                            debug!(target = %target_url, "Endpoint returned JSON error payload, trying next candidate");
+                            continue;
+                        }
+
+                        let res = self.apply_catalog_json(&json_val)?;
+                        if res > 0 {
+                            return Ok(res);
+                        }
                     } else if status == reqwest::StatusCode::NOT_FOUND
                         || status == reqwest::StatusCode::BAD_REQUEST
                     {
