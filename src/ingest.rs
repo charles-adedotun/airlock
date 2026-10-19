@@ -397,6 +397,13 @@ impl LiveBroadcastHub {
             });
         }
 
+        // Strictly enforce single-upstream invariant: abort any previous in-flight sessions
+        // before switching upstream connection to new channel.
+        for (sid, sess) in map.drain() {
+            sess.abort_handle.abort();
+            tracing::info!(stream_id = %sid, "Aborted previous in-flight broadcast session for channel switch");
+        }
+
         // Acquire arbiter lock (enforces single connection invariant and cooldown)
         self.upstream_hub.switch_stream(stream_id).await?;
 
