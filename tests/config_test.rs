@@ -15,7 +15,7 @@ fn test_parse_sample_toml_config_into_typed_structs() {
     let sample = r#"
 [server]
 listen = "0.0.0.0:8795"
-upstream = "http://line.ottcst.org"
+upstream = "http://stream.example.com"
 catalog_upstream = "http://127.0.0.1:8794"
 allow_private_upstream = false
 
@@ -39,7 +39,7 @@ timeshift_max_hours = 2
         .expect("listen address must be a valid SocketAddr");
 
     assert_eq!(config.server.listen, expected_listen);
-    assert_eq!(config.server.upstream, "http://line.ottcst.org");
+    assert_eq!(config.server.upstream, "http://stream.example.com");
     assert_eq!(config.server.catalog_upstream, "http://127.0.0.1:8794");
     assert!(!config.server.allow_private_upstream);
 
@@ -95,7 +95,7 @@ fn test_missing_file_gracefully_falling_back_to_defaults() {
         default_config.server.listen,
         SocketAddr::from(([0, 0, 0, 0], 8795))
     );
-    assert_eq!(default_config.server.upstream, "http://line.ottcst.org");
+    assert_eq!(default_config.server.upstream, "http://stream.example.com");
     assert_eq!(
         default_config.server.catalog_upstream,
         "http://127.0.0.1:8794"
@@ -177,7 +177,7 @@ fn test_precedence_merging_cli_args_override_config_file_values() {
     let base_toml = r#"
 [server]
 listen = "0.0.0.0:8795"
-upstream = "http://line.ottcst.org"
+upstream = "http://stream.example.com"
 catalog_upstream = "http://127.0.0.1:8794"
 allow_private_upstream = false
 
@@ -206,6 +206,8 @@ timeshift_max_hours = 2
         config: None,
         listen: Some(override_listen),
         upstream: None,
+        upstream_user: None,
+        upstream_pass: None,
         catalog_upstream: None,
         cache_dir: Some(PathBuf::from("/mnt/fast_nvme/airlock")),
         max_storage_gb: Some(190),
@@ -215,6 +217,7 @@ timeshift_max_hours = 2
         conflict_policy: Some(ConflictPolicy::Preempt),
         timeshift_max_hours: None,
         allow_private_upstream: Some(true),
+        upstream_proxy: None,
     };
 
     merge_config_with_cli(&mut config, &cli);
@@ -231,7 +234,7 @@ timeshift_max_hours = 2
     assert_eq!(config.streaming.conflict_policy, ConflictPolicy::Preempt);
 
     // Non-overridden fields must preserve original TOML values
-    assert_eq!(config.server.upstream, "http://line.ottcst.org");
+    assert_eq!(config.server.upstream, "http://stream.example.com");
     assert_eq!(config.server.catalog_upstream, "http://127.0.0.1:8794");
     assert_eq!(config.storage.min_disk_free_gb, 10);
     assert_eq!(config.storage.segment_duration_secs, 300);
@@ -297,4 +300,51 @@ fn test_expand_tilde() {
     if let Ok(home) = std::env::var("HOME") {
         assert_eq!(expanded, PathBuf::from(home).join("airlock_test_dir"));
     }
+}
+
+#[test]
+fn test_parse_upstream_credentials_from_toml() {
+    let sample = r#"
+[server]
+listen = "127.0.0.1:8795"
+upstream = "http://stream.example.com"
+upstream_user = "secret_iptv_user"
+upstream_pass = "ultra_secret_pass_999"
+"#;
+
+    let config = AirlockConfigFile::from_toml_str(sample)
+        .expect("TOML with upstream credentials should parse");
+
+    let (user, pass) = config.server.upstream_credentials();
+    assert_eq!(user, "secret_iptv_user");
+    assert_eq!(pass, "ultra_secret_pass_999");
+
+    // CRITICAL: Ensure credentials are redacted in Debug output
+    let debug_repr = format!("{:?}", config.server);
+    assert!(!debug_repr.contains("secret_iptv_user"));
+    assert!(!debug_repr.contains("ultra_secret_pass_999"));
+    assert!(debug_repr.contains("[REDACTED]"));
+}
+
+#[test]
+fn test_cli_credentials_override_and_redaction() {
+    let mut config = AirlockConfigFile::default();
+    assert_eq!(config.server.upstream_credentials(), ("airlock", "proxy"));
+
+    let cli = CliArgs {
+        upstream_user: Some(airlock::security::RedactedString::new("cli_user_override")),
+        upstream_pass: Some(airlock::security::RedactedString::new("cli_pass_override")),
+        ..Default::default()
+    };
+
+    merge_config_with_cli(&mut config, &cli);
+
+    let (user, pass) = config.server.upstream_credentials();
+    assert_eq!(user, "cli_user_override");
+    assert_eq!(pass, "cli_pass_override");
+
+    let debug_str = format!("{config:?}");
+    assert!(!debug_str.contains("cli_user_override"));
+    assert!(!debug_str.contains("cli_pass_override"));
+    assert!(debug_str.contains("[REDACTED]"));
 }

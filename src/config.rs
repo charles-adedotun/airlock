@@ -9,6 +9,8 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::security::RedactedString;
+
 /// Stream arbitration policy on single-tuner conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -51,20 +53,39 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Target upstream IPTV / media provider base URL.
     pub upstream: String,
+    /// Optional upstream IPTV provider username.
+    pub upstream_user: Option<RedactedString>,
+    /// Optional upstream IPTV provider password.
+    pub upstream_pass: Option<RedactedString>,
     /// Internal Python catalog & metadata service base URL.
     pub catalog_upstream: String,
     /// Allow private RFC 1918 and Tailscale CGNAT addresses for upstream tuners.
     pub allow_private_upstream: bool,
+    /// Optional outbound proxy (e.g., socks5h://127.0.0.1:1080) for upstream provider access.
+    pub upstream_proxy: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 8795)),
-            upstream: "http://line.ottcst.org".to_string(),
+            upstream: "http://stream.example.com".to_string(),
+            upstream_user: None,
+            upstream_pass: None,
             catalog_upstream: "http://127.0.0.1:8794".to_string(),
             allow_private_upstream: false,
+            upstream_proxy: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Returns the configured upstream credentials as `(&str, &str)`,
+    /// falling back to legacy defaults `("airlock", "proxy")` if unconfigured.
+    pub fn upstream_credentials(&self) -> (&str, &str) {
+        let user = self.upstream_user.as_deref().unwrap_or("airlock");
+        let pass = self.upstream_pass.as_deref().unwrap_or("proxy");
+        (user, pass)
     }
 }
 
@@ -154,11 +175,20 @@ impl AirlockConfigFile {
         if let Some(ref upstream) = cli.upstream {
             self.server.upstream = upstream.clone();
         }
+        if let Some(ref user) = cli.upstream_user {
+            self.server.upstream_user = Some(user.clone());
+        }
+        if let Some(ref pass) = cli.upstream_pass {
+            self.server.upstream_pass = Some(pass.clone());
+        }
         if let Some(ref catalog_upstream) = cli.catalog_upstream {
             self.server.catalog_upstream = catalog_upstream.clone();
         }
         if let Some(allow_private) = cli.allow_private_upstream {
             self.server.allow_private_upstream = allow_private;
+        }
+        if let Some(ref proxy) = cli.upstream_proxy {
+            self.server.upstream_proxy = Some(proxy.clone());
         }
 
         if let Some(ref cache_dir) = cli.cache_dir {
@@ -229,6 +259,18 @@ pub struct CliArgs {
     /// Target upstream IPTV / media provider base URL
     #[arg(short = 'u', long = "upstream", env = "AIRLOCK_UPSTREAM")]
     pub upstream: Option<String>,
+
+    /// Target upstream IPTV username
+    #[arg(long = "upstream-user", env = "AIRLOCK_UPSTREAM_USER")]
+    pub upstream_user: Option<RedactedString>,
+
+    /// Target upstream IPTV password
+    #[arg(long = "upstream-pass", env = "AIRLOCK_UPSTREAM_PASS")]
+    pub upstream_pass: Option<RedactedString>,
+
+    /// Optional outbound proxy URL (e.g. socks5h://127.0.0.1:1080) for upstream provider access
+    #[arg(long = "upstream-proxy", env = "AIRLOCK_UPSTREAM_PROXY")]
+    pub upstream_proxy: Option<String>,
 
     /// Internal Python catalog & metadata service base URL
     #[arg(long = "catalog-upstream", env = "AIRLOCK_CATALOG_UPSTREAM")]

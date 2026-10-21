@@ -2,6 +2,11 @@
 name = "airlock"
 version = "0.2.0"
 edition = "2024"
+authors = ["Charles Adedotun <charles.adedotun8@gmail.com>"]
+license = "MIT"
+description = "High-throughput streaming proxy, single-upstream arbiter, and zero-copy MPEG-TS ring buffer in Safe Rust."
+repository = "https://github.com/charles-adedotun/airlock"
+readme = "README.md"
 
 [lib]
 name = "airlock"
@@ -15,7 +20,7 @@ path = "src/main.rs"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.7", features = ["tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json", "socks"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

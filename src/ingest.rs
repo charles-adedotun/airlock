@@ -1,5 +1,6 @@
 use crate::error::{IngestError, UpstreamError};
 use crate::ring::LiveRingBuffer;
+use crate::security::{RedactedString, RedactedUrl};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -156,6 +157,11 @@ impl UpstreamHub {
         self.active_connections.load(Ordering::SeqCst)
     }
 
+    /// Returns the currently active stream identifier, if any.
+    pub async fn active_stream(&self) -> Option<String> {
+        self.active_session_id.lock().await.clone()
+    }
+
     /// Acquire the single upstream connection lock for a channel/VOD stream.
     /// If an active stream exists, it cancels it and enforces a teardown cooldown barrier.
     pub async fn switch_stream(
@@ -209,7 +215,7 @@ impl UpstreamHub {
     }
 }
 
-use crate::engine::TsStreamRing;
+use crate::engine::{AdaptiveJitterShield, TsStreamRing, create_null_packets_chunk};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -227,6 +233,7 @@ pub struct LiveBroadcastSession {
     pub subscribers: Arc<AtomicUsize>,
     pub abort_handle: tokio::task::AbortHandle,
     pub created_at: Instant,
+    pub jitter_shield: Arc<AdaptiveJitterShield>,
 }
 
 /// RAII Drop Guard for an active subscriber to a live broadcast session.
@@ -273,8 +280,7 @@ impl Drop for LiveSubscriberGuard {
                 }
 
                 if should_teardown {
-                    // Grace debounce period (1500ms) before terminating upstream socket
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    // Option A: Instant Preemption (0ms) - terminate immediately on disconnect
                     let mut map = sessions.lock().await;
                     if let Some(session) = map.get(&sid) {
                         if session.subscribers.load(Ordering::SeqCst) == 0 {
@@ -314,6 +320,8 @@ pub struct LiveBroadcastHub {
     outbound_client: reqwest::Client,
     upstream_base_url: String,
     ring_capacity: usize,
+    upstream_user: Option<RedactedString>,
+    upstream_pass: Option<RedactedString>,
 }
 
 impl LiveBroadcastHub {
@@ -323,12 +331,32 @@ impl LiveBroadcastHub {
         upstream_base_url: String,
         ring_capacity: usize,
     ) -> Self {
+        Self::with_credentials(
+            upstream_hub,
+            outbound_client,
+            upstream_base_url,
+            ring_capacity,
+            None,
+            None,
+        )
+    }
+
+    pub fn with_credentials(
+        upstream_hub: Arc<UpstreamHub>,
+        outbound_client: reqwest::Client,
+        upstream_base_url: String,
+        ring_capacity: usize,
+        upstream_user: Option<RedactedString>,
+        upstream_pass: Option<RedactedString>,
+    ) -> Self {
         Self {
             upstream_hub,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             outbound_client,
             upstream_base_url,
             ring_capacity,
+            upstream_user,
+            upstream_pass,
         }
     }
 
@@ -351,9 +379,10 @@ impl LiveBroadcastHub {
             // Channel already playing: attach to existing broadcast session!
             session.subscribers.fetch_add(1, Ordering::SeqCst);
             let rx = session.broadcast_tx.subscribe();
+            let cushion_sec = session.jitter_shield.recommended_cushion_sec();
             let burst = session
                 .ts_ring
-                .get_zapping_burst()
+                .get_reservoir_burst(cushion_sec)
                 .ok()
                 .filter(|b| !b.is_empty());
 
@@ -408,7 +437,9 @@ impl LiveBroadcastHub {
         self.upstream_hub.switch_stream(stream_id).await?;
 
         let upstream_base = self.upstream_base_url.trim_end_matches('/');
-        let target_url = format!("{upstream_base}/live/airlock/proxy/{stream_id}.ts");
+        let user = self.upstream_user.as_deref().unwrap_or("airlock");
+        let pass = self.upstream_pass.as_deref().unwrap_or("proxy");
+        let target_url = format!("{upstream_base}/live/{user}/{pass}/{stream_id}.ts");
 
         let resp = match self.outbound_client.get(&target_url).send().await {
             Ok(r) => {
@@ -422,47 +453,95 @@ impl LiveBroadcastHub {
             }
             Err(e) => {
                 self.upstream_hub.release(stream_id).await;
-                return Err(UpstreamError::ConnectionFailed(e.to_string()));
+                let sanitized_err = RedactedUrl::sanitize_str(&e.to_string());
+                tracing::warn!(stream_id = %stream_id, error = %sanitized_err, "Failed to connect to upstream live stream");
+                return Err(UpstreamError::ConnectionFailed(sanitized_err));
             }
         };
 
         let (broadcast_tx, broadcast_rx) = broadcast::channel(256);
         let ts_ring = Arc::new(TsStreamRing::new(self.ring_capacity));
         let subscribers = Arc::new(AtomicUsize::new(1));
+        let jitter_shield = Arc::new(AdaptiveJitterShield::default());
 
         let ring_clone = Arc::clone(&ts_ring);
         let tx_clone = broadcast_tx.clone();
+        let shield_clone = Arc::clone(&jitter_shield);
         let sid = stream_id.to_string();
         let mut byte_stream = resp.bytes_stream();
+        let sessions_clone = Arc::clone(&self.sessions);
+        let hub_clone = Arc::clone(&self.upstream_hub);
 
         let join_handle = tokio::spawn(async move {
-            while let Some(chunk_res) = byte_stream.next().await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        // Ingest into TsStreamRing (synchronizes 188B packets, indexes IDR)
-                        let _ = ring_clone.ingest_raw(&chunk);
-                        // Broadcast chunk to all connected downstreams
-                        let _ = tx_clone.send(chunk);
+            let stall_detection_interval = Duration::from_millis(750);
+            let null_packet_limit = Duration::from_secs(8);
+            let mut stall_started: Option<Instant> = None;
+            let mut stall_timed_out = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    chunk_res = byte_stream.next() => {
+                        match chunk_res {
+                            Some(Ok(chunk)) => {
+                                stall_started = None;
+                                shield_clone.record_chunk_arrival(chunk.len());
+                                let _ = ring_clone.ingest_raw(&chunk);
+                                let _ = tx_clone.send(chunk);
+                            }
+                            Some(Err(err)) => {
+                                let sanitized_err = RedactedUrl::sanitize_str(&err.to_string());
+                                tracing::warn!(stream_id = %sid, error = %sanitized_err, "Upstream live stream closed or reset");
+                                break;
+                            }
+                            None => {
+                                tracing::info!(stream_id = %sid, "Upstream live stream closed (EOF)");
+                                break;
+                            }
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(stream_id = %sid, error = %err, "Upstream live stream closed or reset");
-                        break;
+                    _ = tokio::time::sleep(stall_detection_interval) => {
+                        let now = Instant::now();
+                        let stall_start = *stall_started.get_or_insert(now);
+                        let duration = now.duration_since(stall_start);
+
+                        if duration > null_packet_limit {
+                            tracing::warn!(stream_id = %sid, duration_secs = duration.as_secs_f64(), "Upstream stall exceeded 8.0s hard ceiling, terminating cleanly");
+                            stall_timed_out = true;
+                            break;
+                        }
+
+                        // Inject standard MPEG-TS null packet chunk (7 TS packets = 1316 bytes MTU aligned)
+                        let null_chunk = create_null_packets_chunk();
+                        let _ = tx_clone.send(null_chunk);
                     }
                 }
+            }
+
+            // If upstream stall exceeded 8.0s ceiling, trigger clean teardown immediately:
+            // Remove in-flight session and release upstream hub lock to prevent resource leaks/deadlocks.
+            if stall_timed_out {
+                let mut map = sessions_clone.lock().await;
+                map.remove(&sid);
+                hub_clone.release(&sid).await;
+                tracing::info!(stream_id = %sid, "Upstream stall exceeded 8.0s ceiling: session torn down cleanly");
             }
             tracing::info!(stream_id = %sid, "Upstream ingest task completed");
         });
 
         let session = Arc::new(LiveBroadcastSession {
             stream_id: stream_id.to_string(),
-            ts_ring,
+            ts_ring: Arc::clone(&ts_ring),
             broadcast_tx,
             subscribers,
             abort_handle: join_handle.abort_handle(),
             created_at: Instant::now(),
+            jitter_shield,
         });
 
-        map.insert(stream_id.to_string(), session);
+        map.insert(stream_id.to_string(), Arc::clone(&session));
+
+        let burst = ts_ring.get_zapping_burst().ok().filter(|b| !b.is_empty());
 
         let live_stream = BroadcastStream::new(broadcast_rx).filter_map(|res| async move {
             match res {
@@ -479,7 +558,12 @@ impl LiveBroadcastHub {
 
         let boxed_stream: Pin<
             Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-        > = Box::pin(live_stream);
+        > = match burst {
+            Some(b) => {
+                Box::pin(futures_util::stream::once(async move { Ok(b) }).chain(live_stream))
+            }
+            None => Box::pin(live_stream),
+        };
 
         let guard = LiveSubscriberGuard::new(
             Arc::clone(&self.sessions),
@@ -514,5 +598,25 @@ impl LiveBroadcastHub {
     /// Retrieve the active broadcast session for a stream if in-flight.
     pub async fn get_session(&self, stream_id: &str) -> Option<Arc<LiveBroadcastSession>> {
         self.sessions.lock().await.get(stream_id).cloned()
+    }
+
+    /// Retrieve active session jitter metrics: (recommended_cushion_sec, measured_jitter_ms, stalls_absorbed, total_bytes).
+    pub async fn get_session_metrics(&self, stream_id: &str) -> Option<(f64, f64, u64, u64)> {
+        let map = self.sessions.lock().await;
+        let session = map.get(stream_id)?;
+        Some((
+            session.jitter_shield.recommended_cushion_sec(),
+            session.jitter_shield.measured_jitter_ms(),
+            session.jitter_shield.stalls_absorbed(),
+            session.jitter_shield.total_bytes_ingested(),
+        ))
+    }
+
+    /// Report a client playback stall for closed-loop self-healing cushion expansion.
+    pub async fn record_client_stall(&self, stream_id: &str) {
+        let map = self.sessions.lock().await;
+        if let Some(session) = map.get(stream_id) {
+            session.jitter_shield.record_client_stall();
+        }
     }
 }

@@ -355,6 +355,48 @@ fn test_hls_playlist_generation_from_ts_ring() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn test_hls_segment_slicing_complete_gop_from_ts_ring() -> Result<(), Box<dyn std::error::Error>> {
+    let ring = TsStreamRing::new(1024 * 1024);
+    let idr_pkt = make_test_packet(256, true);
+    let norm_pkt = make_test_packet(256, false);
+
+    // GOP 1: IDR packet + 10 normal packets
+    ring.ingest_raw(&idr_pkt)?;
+    for _ in 0..10 {
+        ring.ingest_raw(&norm_pkt)?;
+    }
+
+    // GOP 2: IDR packet + 10 normal packets
+    ring.ingest_raw(&idr_pkt)?;
+    for _ in 0..10 {
+        ring.ingest_raw(&norm_pkt)?;
+    }
+
+    // Slicing GOP 1 starting at sequence 0 must return more than 1 packet (188 bytes)!
+    // It must return the complete GOP (11 packets) plus any prepended PSI tables.
+    let seg1 = ring.get_segment(0, 1000)?;
+    assert!(
+        seg1.len() > TS_PACKET_SIZE,
+        "Segment must not be a single 188-byte packet!"
+    );
+    assert_eq!(
+        seg1.len() % TS_PACKET_SIZE,
+        0,
+        "Segment must consist of 188-byte aligned packets"
+    );
+    assert!(
+        seg1.len() >= 11 * TS_PACKET_SIZE,
+        "GOP 1 must contain at least all 11 packets of the GOP"
+    );
+
+    // Slicing GOP 2 starting at sequence 11 must slice GOP 2
+    let seg2 = ring.get_segment(11, 1000)?;
+    assert!(seg2.len() >= 11 * TS_PACKET_SIZE);
+
+    Ok(())
+}
+
+#[test]
 fn test_hls_master_multivariant_playlist() {
     let variants = vec![
         HlsVariant {

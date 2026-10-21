@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -23,10 +23,12 @@ use airlock::arbiter::{ArbiterSubscriberGuard, ChannelArbiter, ConflictPolicy as
 use airlock::config::{
     AirlockConfigFile, CliArgs, ConflictPolicy as ConfigConflictPolicy, load_config_with_fallback,
 };
-use airlock::engine::{CatalogSyncManager, HlsPlaylistGenerator, LineupManager, create_lineup_router};
+use airlock::engine::{
+    CatalogSyncManager, HlsPlaylistGenerator, LineupManager, create_lineup_router,
+};
 use airlock::ingest::{LiveBroadcastHub, UpstreamHub};
 use airlock::range::{HttpRange, parse_range_header, resolve_range};
-use airlock::security::{SafePathGuard, create_hardened_http_client};
+use airlock::security::{RedactedUrl, SafePathGuard, create_hardened_http_client};
 use airlock::signals::wait_for_shutdown_signal;
 #[cfg(unix)]
 use airlock::storage::posix_fadvise_dontneed_fd;
@@ -111,6 +113,17 @@ async fn healthz_handler() -> impl IntoResponse {
 async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let usage = state.quota_manager.usage_info(&state.cache_dir).await.ok();
     let (max_storage_gb, min_disk_free_gb) = state.quota_manager.current_limits().await;
+    let (cushion, jitter_ms, stalls_absorbed, total_bytes) =
+        if let Some(ref sid) = state.arbiter.active_stream() {
+            state
+                .broadcast_hub
+                .get_session_metrics(sid)
+                .await
+                .unwrap_or((3.5, 0.0, 0, 0))
+        } else {
+            (3.5, 0.0, 0, 0)
+        };
+
     Json(json!({
         "service": "airlock",
         "version": env!("CARGO_PKG_VERSION"),
@@ -125,17 +138,42 @@ async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
         },
         "live_streaming": {
             "sports_target_latency_sec": state.config.streaming.sports_latency_sec,
-            "catchup_slew_rate": 1.05,
+            "live_sync_mode": "instant_keyframe_leap",
             "conflict_policy": state.config.streaming.conflict_policy.to_string(),
             "active_broadcast_sessions": state.broadcast_hub.active_sessions_count().await,
             "active_stream_id": state.arbiter.active_stream(),
-            "active_subscribers": state.arbiter.active_subscribers()
+            "active_subscribers": state.arbiter.active_subscribers(),
+            "pre_roll_cushion_sec": cushion,
+            "measured_upstream_jitter_ms": jitter_ms,
+            "upstream_stalls_absorbed": stalls_absorbed,
+            "total_bytes_ingested": total_bytes,
+            "zero_buffering_contract": "enforced"
         },
         "sports_target_latency_sec": state.config.streaming.sports_latency_sec,
         "conflict_policy": state.config.streaming.conflict_policy.to_string(),
         "active_broadcast_sessions": state.broadcast_hub.active_sessions_count().await,
         "host_memory_headroom_ok": check_host_memory_headroom()
     }))
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    airlock::metrics::render_metrics_response(
+        &state.quota_manager,
+        &state.cache_dir,
+        &state.broadcast_hub,
+        &state.arbiter,
+    )
+    .await
+}
+
+async fn report_stall_handler(
+    State(state): State<AppState>,
+    Path(stream_id): Path<String>,
+) -> impl IntoResponse {
+    let clean_id = clean_stream_id(&stream_id);
+    state.broadcast_hub.record_client_stall(&clean_id).await;
+    tracing::warn!(stream_id = %clean_id, "Received client playback stall report; dynamic cushion expanded");
+    StatusCode::OK
 }
 
 #[derive(Deserialize, Debug)]
@@ -148,8 +186,12 @@ async fn update_quota_handler(
     State(state): State<AppState>,
     Json(payload): Json<UpdateQuotaPayload>,
 ) -> impl IntoResponse {
-    let max_gb = payload.max_storage_gb.unwrap_or(state.config.storage.max_storage_gb);
-    let min_free_gb = payload.min_disk_free_gb.unwrap_or(state.config.storage.min_disk_free_gb);
+    let max_gb = payload
+        .max_storage_gb
+        .unwrap_or(state.config.storage.max_storage_gb);
+    let min_free_gb = payload
+        .min_disk_free_gb
+        .unwrap_or(state.config.storage.min_disk_free_gb);
     state.quota_manager.update_quota(max_gb, min_free_gb).await;
     (
         StatusCode::OK,
@@ -168,6 +210,8 @@ fn clean_stream_id(raw: &str) -> String {
     let s = s.strip_suffix(".ts").unwrap_or(s);
     let s = s.strip_suffix(".m3u8").unwrap_or(s);
     let s = s.strip_suffix(".mp4").unwrap_or(s);
+    let s = s.strip_suffix(".mkv").unwrap_or(s);
+    let s = s.strip_suffix(".avi").unwrap_or(s);
     s.to_string()
 }
 
@@ -210,14 +254,30 @@ async fn serve_live_stream_internal(state: AppState, stream_id: String, force: b
                 stream,
                 _guard: guard,
             };
+            let (cushion_target, _, _, _) = state
+                .broadcast_hub
+                .get_session_metrics(&stream_id)
+                .await
+                .unwrap_or((3.5, 0.0, 0, 0));
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "video/mp2t")
                 .header(header::CACHE_CONTROL, "no-store")
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header("X-Airlock-Live-Lag-Sec", format!("{:.2}", state.config.streaming.sports_latency_sec))
-                .header("X-Airlock-Sports-Target-Sec", format!("{:.2}", state.config.streaming.sports_latency_sec))
-                .header("X-Airlock-Catchup-Slew-Rate", "1.05")
+                .header(
+                    "X-Airlock-Live-Lag-Sec",
+                    format!("{:.2}", state.config.streaming.sports_latency_sec),
+                )
+                .header(
+                    "X-Airlock-Sports-Target-Sec",
+                    format!("{:.2}", state.config.streaming.sports_latency_sec),
+                )
+                .header("X-Airlock-Live-Sync", "instant_keyframe_leap")
+                .header(
+                    "X-Airlock-Cushion-Target-Sec",
+                    format!("{cushion_target:.2}"),
+                )
+                .header("X-Airlock-Zero-Buffering", "contract-enforced")
                 .header(header::CONNECTION, "close")
                 .body(axum::body::Body::from_stream(guarded))
                 .unwrap_or_else(|_| {
@@ -225,10 +285,11 @@ async fn serve_live_stream_internal(state: AppState, stream_id: String, force: b
                 })
         }
         Err(err) => {
-            tracing::warn!(stream_id = %stream_id, error = %err, "Live stream subscription failed");
+            let sanitized_err = RedactedUrl::sanitize_str(&err.to_string());
+            tracing::warn!(stream_id = %stream_id, error = %sanitized_err, "Live stream subscription failed");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to connect to live stream: {err}"),
+                format!("Failed to connect to live stream: {sanitized_err}"),
             )
                 .into_response()
         }
@@ -274,7 +335,9 @@ async fn serve_hls_playlist_internal(state: AppState, stream_id: String) -> Resp
         .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(axum::body::Body::from(playlist))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "HLS playlist error").into_response())
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "HLS playlist error").into_response()
+        })
 }
 
 async fn handle_hls_segment(
@@ -288,14 +351,14 @@ async fn handle_hls_segment(
 
     if let Ok(seq) = seq_str.parse::<u64>() {
         if let Some(session) = state.broadcast_hub.get_session(&clean_id).await {
-            if let Ok((chunks, _)) = session.ts_ring.read_from(seq, 1) {
-                if let Some(chunk) = chunks.into_iter().next() {
+            if let Ok(data) = session.ts_ring.get_segment(seq, 50_000) {
+                if !data.is_empty() {
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "video/mp2t")
                         .header(header::CACHE_CONTROL, "public, max-age=60")
                         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                        .body(axum::body::Body::from(chunk.data))
+                        .body(axum::body::Body::from(data))
                         .unwrap_or_else(|_| {
                             (StatusCode::INTERNAL_SERVER_ERROR, "Segment error").into_response()
                         });
@@ -304,33 +367,45 @@ async fn handle_hls_segment(
         }
     }
 
-    (StatusCode::NOT_FOUND, "Segment not found or expired from ring buffer").into_response()
+    (
+        StatusCode::NOT_FOUND,
+        "Segment not found or expired from ring buffer",
+    )
+        .into_response()
 }
 
 // VOD & Range Handlers
 
 async fn handle_vod_xtream(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     Path((_user, _pass, target)): Path<(String, String, String)>,
 ) -> Response {
+    let ext = if let Some(dot_idx) = target.rfind('.') {
+        &target[dot_idx + 1..]
+    } else {
+        "mp4"
+    };
     let stream_id = clean_stream_id(&target);
-    serve_vod_internal(state, headers, stream_id, "mp4").await
+    serve_vod_internal(state, &uri, headers, stream_id, ext).await
 }
 
 async fn handle_vod_query(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     Query(q): Query<VodStreamQuery>,
 ) -> Response {
     let stream_id = q.stream_id.unwrap_or_else(|| "0".into());
     let stream_id = clean_stream_id(&stream_id);
     let ext = q.ext.unwrap_or_else(|| "mp4".into());
-    serve_vod_internal(state, headers, stream_id, &ext).await
+    serve_vod_internal(state, &uri, headers, stream_id, &ext).await
 }
 
 async fn serve_vod_internal(
     state: AppState,
+    uri: &Uri,
     headers: HeaderMap,
     stream_id: String,
     ext: &str,
@@ -378,7 +453,11 @@ async fn serve_vod_internal(
                     #[cfg(unix)]
                     {
                         use std::os::unix::io::AsRawFd;
-                        let _ = posix_fadvise_dontneed_fd(file.as_raw_fd(), start as i64, length as i64);
+                        let _ = posix_fadvise_dontneed_fd(
+                            file.as_raw_fd(),
+                            start as i64,
+                            length as i64,
+                        );
                     }
 
                     let take_file = tokio_util::io::ReaderStream::new(file.take(length));
@@ -402,7 +481,14 @@ async fn serve_vod_internal(
 
     // Fallback: proxy upstream with Range header forwarding
     let upstream_base = state.config.server.upstream.trim_end_matches('/');
-    let target_url = format!("{upstream_base}/movie/airlock/proxy/{stream_id}.{ext}");
+    let (user, pass) = state.config.server.upstream_credentials();
+    let is_series =
+        uri.path().starts_with("/series/") || uri.query().is_some_and(|q| q.contains("series"));
+    let target_url = if is_series {
+        format!("{upstream_base}/series/{user}/{pass}/{stream_id}.{ext}")
+    } else {
+        format!("{upstream_base}/movie/{user}/{pass}/{stream_id}.{ext}")
+    };
 
     let mut req = state.outbound_client.get(&target_url);
     if let Some(r) = headers.get(header::RANGE) {
@@ -427,10 +513,11 @@ async fn serve_vod_internal(
                 })
         }
         Err(err) => {
-            tracing::warn!(stream_id = %stream_id, error = %err, "Upstream VOD request failed");
+            let sanitized_err = RedactedUrl::sanitize_str(&err.to_string());
+            tracing::warn!(stream_id = %stream_id, error = %sanitized_err, "Upstream VOD request failed");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to proxy VOD stream: {err}"),
+                format!("Failed to proxy VOD stream: {sanitized_err}"),
             )
                 .into_response()
         }
@@ -439,12 +526,13 @@ async fn serve_vod_internal(
 
 // Fallback Proxy to Python Catalog Backend (:8794)
 
-async fn proxy_catalog_fallback(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response {
+async fn proxy_catalog_fallback(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let catalog_base = state.config.server.catalog_upstream.trim_end_matches('/');
     let target_url = format!("{catalog_base}{path}{query}");
 
@@ -476,11 +564,13 @@ async fn proxy_catalog_fallback(
                 })
         }
         Err(err) => {
-            tracing::warn!(target = %target_url, error = %err, "Failed to proxy to catalog backend");
+            let sanitized_target = RedactedUrl::sanitize_str(&target_url);
+            let sanitized_err = RedactedUrl::sanitize_str(&err.to_string());
+            tracing::warn!(target = %sanitized_target, error = %sanitized_err, "Failed to proxy to catalog backend");
             (
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "Catalog backend unreachable at {}: {err}",
+                    "Catalog backend unreachable at {}: {sanitized_err}",
                     state.config.server.catalog_upstream
                 ),
             )
@@ -528,13 +618,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let outbound_client = create_hardened_http_client(config.server.allow_private_upstream)?;
+    let outbound_client = create_hardened_http_client(
+        config.server.allow_private_upstream,
+        config.server.upstream_proxy.as_deref(),
+    )?;
 
-    let broadcast_hub = Arc::new(LiveBroadcastHub::new(
+    let broadcast_hub = Arc::new(LiveBroadcastHub::with_credentials(
         Arc::clone(&upstream_hub),
         outbound_client.clone(),
         config.server.upstream.clone(),
         16 * 1024 * 1024,
+        config.server.upstream_user.clone(),
+        config.server.upstream_pass.clone(),
     ));
 
     let lineup_manager = Arc::new(LineupManager::new(
@@ -549,10 +644,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         internal_client.clone(),
         config.server.catalog_upstream.clone(),
     ));
-    let _catalog_task = catalog_sync.spawn_periodic_sync(
-        Duration::from_secs(6 * 3600),
-        catalog_shutdown_rx,
-    );
+    let _catalog_task =
+        catalog_sync.spawn_periodic_sync(Duration::from_secs(6 * 3600), catalog_shutdown_rx);
 
     let app_state = AppState {
         config: Arc::clone(&config),
@@ -570,14 +663,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz_handler))
         .route("/api/healthz", get(healthz_handler))
         .route("/api/status", get(status_handler))
-        .route("/api/storage/quota", axum::routing::post(update_quota_handler))
+        .route("/metrics", get(metrics_handler))
+        .route(
+            "/api/telemetry/stall/:stream_id",
+            axum::routing::post(report_stall_handler),
+        )
+        .route(
+            "/api/storage/quota",
+            axum::routing::post(update_quota_handler),
+        )
         // Raw TS Streaming routes
         .route("/live/:user/:pass/:target", get(handle_live_xtream))
         .route("/api/stream/live", get(handle_live_query))
         // Dynamic Sliding-Window HLS routes
-        .route("/live/hls/:user/:pass/:target/index.m3u8", get(handle_hls_playlist_xtream))
+        .route(
+            "/live/hls/:user/:pass/:target/index.m3u8",
+            get(handle_hls_playlist_xtream),
+        )
         .route("/api/stream/hls/index.m3u8", get(handle_hls_playlist_query))
-        .route("/live/hls/proxy/:stream_id/:segment", get(handle_hls_segment))
+        .route(
+            "/live/hls/proxy/:stream_id/:segment",
+            get(handle_hls_segment),
+        )
         .route("/movie/:user/:pass/:target", get(handle_vod_xtream))
         .route("/series/:user/:pass/:target", get(handle_vod_xtream))
         .route("/api/stream/vod", get(handle_vod_query))
@@ -610,4 +717,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_stream_id_extensions() {
+        assert_eq!(clean_stream_id("12345.ts"), "12345");
+        assert_eq!(clean_stream_id("12345.m3u8"), "12345");
+        assert_eq!(clean_stream_id("12345.mp4"), "12345");
+        assert_eq!(clean_stream_id("12345.mkv"), "12345");
+        assert_eq!(clean_stream_id("12345.avi"), "12345");
+        assert_eq!(clean_stream_id("12345"), "12345");
+    }
+
+    #[test]
+    fn test_series_vs_movie_upstream_url_construction() {
+        let upstream_base = "http://stream.example.com";
+        let user = "test_user";
+        let pass = "test_pass";
+        let stream_id = "555";
+        let ext = "mp4";
+
+        // Series URI
+        let uri_series: Uri = "/series/test_user/test_pass/555.mp4"
+            .parse()
+            .expect("valid uri");
+        let is_series = uri_series.path().starts_with("/series/")
+            || uri_series.query().is_some_and(|q| q.contains("series"));
+        let target_series = if is_series {
+            format!("{upstream_base}/series/{user}/{pass}/{stream_id}.{ext}")
+        } else {
+            format!("{upstream_base}/movie/{user}/{pass}/{stream_id}.{ext}")
+        };
+        assert_eq!(
+            target_series,
+            "http://stream.example.com/series/test_user/test_pass/555.mp4"
+        );
+
+        // Movie URI
+        let uri_movie: Uri = "/movie/test_user/test_pass/555.mp4"
+            .parse()
+            .expect("valid uri");
+        let is_movie_series = uri_movie.path().starts_with("/series/")
+            || uri_movie.query().is_some_and(|q| q.contains("series"));
+        let target_movie = if is_movie_series {
+            format!("{upstream_base}/series/{user}/{pass}/{stream_id}.{ext}")
+        } else {
+            format!("{upstream_base}/movie/{user}/{pass}/{stream_id}.{ext}")
+        };
+        assert_eq!(
+            target_movie,
+            "http://stream.example.com/movie/test_user/test_pass/555.mp4"
+        );
+
+        // Query URI with series context
+        let uri_query_series: Uri = "/api/stream/vod?stream_id=555&kind=series"
+            .parse()
+            .expect("valid uri");
+        let is_q_series = uri_query_series.path().starts_with("/series/")
+            || uri_query_series
+                .query()
+                .is_some_and(|q| q.contains("series"));
+        assert!(is_q_series);
+    }
 }

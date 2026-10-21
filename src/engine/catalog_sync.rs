@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::engine::lineup::{ChannelEntry, LineupManager};
 use crate::error::{AirlockError, IngestError};
+use crate::security::RedactedUrl;
 
 /// Default candidate endpoints checked when syncing from a catalog base URL.
 pub const CANDIDATE_ENDPOINTS: &[&str] = &[
@@ -101,7 +102,7 @@ impl CatalogSyncManager {
         let mut last_err = None;
         for endpoint in CANDIDATE_ENDPOINTS {
             let target_url = format!("{base}{endpoint}");
-            debug!(target = %target_url, "Probing catalog endpoint");
+            debug!(target = %RedactedUrl::sanitize_str(&target_url), "Probing catalog endpoint");
 
             match self.client.get(&target_url).send().await {
                 Ok(resp) => {
@@ -114,7 +115,8 @@ impl CatalogSyncManager {
                         let json_val: serde_json::Value =
                             serde_json::from_slice(&bytes).map_err(|e| {
                                 AirlockError::Internal(format!(
-                                    "Failed to parse catalog JSON from {target_url}: {e}"
+                                    "Failed to parse catalog JSON from {}: {e}",
+                                    RedactedUrl::sanitize_str(&target_url)
                                 ))
                             })?;
                         // If endpoint returned an error object (e.g. {"error": "not found"} with HTTP 200), try next candidate
@@ -123,7 +125,7 @@ impl CatalogSyncManager {
                             && json_val.get("items").is_none()
                             && json_val.get("channels").is_none()
                         {
-                            debug!(target = %target_url, "Endpoint returned JSON error payload, trying next candidate");
+                            debug!(target = %RedactedUrl::sanitize_str(&target_url), "Endpoint returned JSON error payload, trying next candidate");
                             continue;
                         }
 
@@ -143,14 +145,14 @@ impl CatalogSyncManager {
                     } else {
                         warn!(
                             status = %status,
-                            target = %target_url,
+                            target = %RedactedUrl::sanitize_str(&target_url),
                             "Catalog endpoint returned HTTP error status"
                         );
                         return Err(AirlockError::Ingest(IngestError::BadStatus(status)));
                     }
                 }
                 Err(err) => {
-                    warn!(error = %err, target = %target_url, "Network connection to catalog failed");
+                    warn!(error = %err, target = %RedactedUrl::sanitize_str(&target_url), "Network connection to catalog failed");
                     return Err(AirlockError::Ingest(IngestError::Network(err)));
                 }
             }
@@ -182,7 +184,8 @@ impl CatalogSyncManager {
 
         let json_val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
             AirlockError::Internal(format!(
-                "Failed to parse catalog JSON from {target_url}: {e}"
+                "Failed to parse catalog JSON from {}: {e}",
+                RedactedUrl::sanitize_str(target_url)
             ))
         })?;
 

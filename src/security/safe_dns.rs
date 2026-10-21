@@ -158,10 +158,13 @@ impl Resolve for SafeDnsResolver {
             let host_str = name.as_str();
 
             // Perform DNS lookup asynchronously via Tokio's threadpool resolver
-            let addrs = tokio::net::lookup_host((host_str, 80)).await.map_err(|e| {
-                Box::new(NetworkSecurityError::LookupIoError(e.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?;
+            let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host_str, 80)).await {
+                Ok(iter) => iter.collect(),
+                Err(e) => {
+                    return Err(Box::new(NetworkSecurityError::LookupIoError(e.to_string()))
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            };
 
             let mut safe_addrs = Vec::new();
             for addr in addrs {
@@ -192,20 +195,33 @@ impl Resolve for SafeDnsResolver {
 }
 
 /// Creates a security-hardened `reqwest::Client` configured with:
-/// - `SafeDnsResolver` blocking private, link-local, loopback, and Tailscale subnets.
+/// - `SafeDnsResolver` blocking private, link-local, loopback, and Tailscale subnets (when no outbound proxy is set).
+/// - Outbound proxy support (e.g., SOCKS5h) for residential/tunnel gateway access.
 /// - Option to permit private homelab/Tailscale networks via `allow_private`.
-/// - Redirects disabled (`redirect::Policy::none()`) to prevent redirect-based SSRF.
-/// - Strict connection and read timeouts.
+/// - Limited redirects (`redirect::Policy::limited(10)`) allowing upstream CDN stream edge handover
+///   while resolving and validating all redirect targets through `SafeDnsResolver`.
+/// - Strict connection timeout without total request timeout (essential for indefinite MPEG-TS live streams).
 /// - Rustls TLS backend.
-pub fn create_hardened_http_client(allow_private: bool) -> Result<Client, reqwest::Error> {
-    Client::builder()
-        .dns_resolver(Arc::new(SafeDnsResolver::with_allow_private(allow_private)))
-        .redirect(redirect::Policy::none())
+/// - IPTV compatible User-Agent (`okhttp/4.12.0`).
+pub fn create_hardened_http_client(
+    allow_private: bool,
+    proxy: Option<&str>,
+) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder()
+        .redirect(redirect::Policy::limited(10))
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
         .tcp_nodelay(true)
         .use_rustls_tls()
-        .build()
+        .user_agent("okhttp/4.12.0");
+
+    if let Some(proxy_url) = proxy.filter(|p| !p.trim().is_empty()) {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    } else {
+        builder =
+            builder.dns_resolver(Arc::new(SafeDnsResolver::with_allow_private(allow_private)));
+    }
+
+    builder.build()
 }
 
 #[cfg(test)]
@@ -328,7 +344,7 @@ mod tests {
     #[test]
     fn test_allow_private_policy() {
         let lan_ip = IpAddr::from_str("192.168.1.50").unwrap();
-        let tailscale_ip = IpAddr::from_str("100.121.141.32").unwrap();
+        let tailscale_ip = IpAddr::from_str("100.64.1.50").unwrap();
         let rfc10_ip = IpAddr::from_str("10.0.1.1").unwrap();
         let metadata_ip = IpAddr::from_str("169.254.169.254").unwrap();
         let loopback_ip = IpAddr::from_str("127.0.0.1").unwrap();

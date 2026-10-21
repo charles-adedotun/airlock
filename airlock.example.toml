@@ -3,7 +3,7 @@
 
 [server]
 listen = "0.0.0.0:8795"
-upstream = "http://line.ottcst.org"
+upstream = "http://stream.example.com"
 catalog_upstream = "http://127.0.0.1:8794"
 allow_private_upstream = false
 

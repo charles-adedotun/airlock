@@ -5,7 +5,9 @@
 //! cached PAT, PMT, SPS/PPS parameter sets, and the latest IDR frame directly to new sockets.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use std::collections::VecDeque;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use crate::error::StorageError;
 use crate::ring::{LiveRingBuffer, RingChunk};
@@ -33,6 +35,9 @@ pub struct TsPacketMeta {
 pub struct MpegTsSynchronizer {
     residue: Vec<u8>,
 }
+
+/// Alias for [`MpegTsSynchronizer`] reflecting its role as a ring buffer synchronizer.
+pub type TsRingSynchronizer = MpegTsSynchronizer;
 
 /// Validate MPEG-TS packet header structure (sync byte, non-reserved AFC, and valid adaptation length).
 pub fn is_valid_ts_header(pkt: &[u8]) -> bool {
@@ -385,6 +390,34 @@ pub fn extract_audio_pids_from_pmt(packet: &[u8]) -> Vec<u16> {
     audio_pids
 }
 
+/// Create a standard MPEG-TS null packet (PID 0x1FFF).
+/// Used as a keepalive during upstream WAN stalls to maintain decoder pipeline health.
+pub fn create_ts_null_packet() -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xFF; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE; // 0x47
+    pkt[1] = 0x1F; // transport_error:0, payload_start:0, priority:0, PID[12..8]: 0x1F
+    pkt[2] = 0xFF; // PID[7..0]: 0xFF => PID 0x1FFF
+    pkt[3] = 0x10; // scrambling:00, adaptation:01 (payload only), continuity:0
+    pkt
+}
+
+/// Create an MTU-aligned chunk of 7 MPEG-TS null packets (1316 bytes).
+pub fn create_null_packets_chunk() -> Bytes {
+    let null_pkt = create_ts_null_packet();
+    let mut buf = BytesMut::with_capacity(TS_PACKET_SIZE * 7);
+    for _ in 0..7 {
+        buf.put_slice(&null_pkt);
+    }
+    buf.freeze()
+}
+
+/// Anchor tracking an indexed IDR keyframe in the circular buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframeAnchor {
+    pub sequence: u64,
+    pub timestamp: Instant,
+}
+
 /// Thread-safe MPEG-TS streaming ring buffer with sub-second zapping burst generation.
 pub struct TsStreamRing {
     ring: LiveRingBuffer,
@@ -400,6 +433,7 @@ struct TsStreamState {
     video_pid: Option<u16>,
     audio_pids: Vec<u16>,
     latest_idr_seq: Option<u64>,
+    recent_idrs: VecDeque<KeyframeAnchor>,
 }
 
 impl TsStreamRing {
@@ -416,13 +450,17 @@ impl TsStreamRing {
                 video_pid: None,
                 audio_pids: Vec::new(),
                 latest_idr_seq: None,
+                recent_idrs: VecDeque::new(),
             }),
         }
     }
 
     /// Retrieve currently identified elementary audio PIDs from cached PMT.
     pub fn audio_pids(&self) -> Vec<u16> {
-        self.state.read().map(|s| s.audio_pids.clone()).unwrap_or_default()
+        self.state
+            .read()
+            .map(|s| s.audio_pids.clone())
+            .unwrap_or_default()
     }
 
     /// Push raw chunks into the synchronizer, parse TS packets, index keyframes,
@@ -464,6 +502,13 @@ impl TsStreamRing {
 
                 if m.is_idr {
                     state.latest_idr_seq = Some(seq);
+                    state.recent_idrs.push_back(KeyframeAnchor {
+                        sequence: seq,
+                        timestamp: Instant::now(),
+                    });
+                    while state.recent_idrs.len() > 32 {
+                        state.recent_idrs.pop_front();
+                    }
                 }
             } else {
                 self.ring.push(packet, false)?;
@@ -473,21 +518,36 @@ impl TsStreamRing {
         Ok(count)
     }
 
-    /// Generate an instantaneous **Zero-Holdback Sub-Second Zapping Burst**.
+    /// Locate a keyframe anchor sequence `target_seconds` in the past (GOP-aligned).
+    pub fn get_keyframe_at_offset(&self, target_seconds: f64) -> Option<u64> {
+        let state = self.state.read().ok()?;
+        let now = Instant::now();
+        let target_dur = Duration::from_secs_f64(target_seconds.max(0.0));
+
+        let mut chosen = None;
+        for kf in state.recent_idrs.iter().rev() {
+            if now.duration_since(kf.timestamp) >= target_dur {
+                chosen = Some(kf.sequence);
+                break;
+            }
+        }
+        chosen
+            .or_else(|| state.recent_idrs.front().map(|k| k.sequence))
+            .or(state.latest_idr_seq)
+    }
+
+    /// Generate an adaptive pre-roll reservoir burst starting from a GOP keyframe `target_seconds`
+    /// in the past, prepended with PAT, PMT, and SPS/PPS parameter sets.
     ///
-    /// Produces a byte payload containing:
-    /// 1. Latest cached PAT packet (PID 0).
-    /// 2. Latest cached PMT packet.
-    /// 3. Cached SPS / PPS parameter sets.
-    /// 4. All packets starting from the most recent IDR frame up to current write head.
-    ///
-    /// This provides client decoders with everything necessary to render video in < 450ms.
-    pub fn get_zapping_burst(&self) -> Result<Bytes, StorageError> {
+    /// This immediately primes downstream player buffers (ExoPlayer, VLC, browser) with
+    /// seconds of continuous media, making them fully immune to upstream WAN stalls.
+    pub fn get_reservoir_burst(&self, target_seconds: f64) -> Result<Bytes, StorageError> {
+        let start_seq = self.get_keyframe_at_offset(target_seconds);
         let state = self.state.read().map_err(|_| {
             StorageError::Io(std::io::Error::other("TsStreamRing state lock poisoned"))
         })?;
 
-        let mut burst = BytesMut::with_capacity(TS_PACKET_SIZE * 64);
+        let mut burst = BytesMut::with_capacity(TS_PACKET_SIZE * 512);
 
         // 1. Inject cached PAT
         if let Some(ref pat) = state.cached_pat {
@@ -504,15 +564,73 @@ impl TsStreamRing {
             burst.put_slice(sps_pps);
         }
 
-        // 4. Retrieve chunks starting from the latest keyframe sequence
-        if let Some(idr_seq) = state.latest_idr_seq {
-            let (chunks, _) = self.ring.read_from(idr_seq, 500)?;
+        // 4. Retrieve all packets from start_seq up to the current head
+        let seq_to_read = start_seq
+            .or(state.latest_idr_seq)
+            .or_else(|| self.ring.oldest_sequence());
+        if let Some(seq) = seq_to_read {
+            let max_pkts = ((target_seconds.max(1.0) * 4500.0).max(25_000.0)) as usize;
+            let (chunks, _) = self.ring.read_from(seq, max_pkts)?;
             for chunk in chunks {
                 burst.put_slice(&chunk.data);
             }
         }
 
         Ok(burst.freeze())
+    }
+
+    /// Generate an instantaneous **Zero-Holdback Sub-Second Zapping Burst**.
+    ///
+    /// Produces a byte payload containing PAT, PMT, SPS/PPS parameter sets,
+    /// and packets starting from the most recent IDR frame.
+    pub fn get_zapping_burst(&self) -> Result<Bytes, StorageError> {
+        self.get_reservoir_burst(0.0)
+    }
+
+    /// Extracts a complete HLS media segment (GOP) from RAM starting at `start_seq`
+    /// up to the next keyframe boundary (or up to `max_packets`).
+    /// Prepends cached PAT, PMT, and SPS/PPS parameter sets as required by RFC 8216
+    /// so downstream players can immediately demux and render the segment.
+    pub fn get_segment(&self, start_seq: u64, max_packets: usize) -> Result<Bytes, StorageError> {
+        let (chunks, _) = self.ring.read_from(start_seq, max_packets)?;
+        if chunks.is_empty() {
+            return Ok(Bytes::new());
+        }
+
+        let state = self.state.read().map_err(|_| {
+            StorageError::Io(std::io::Error::other("TsStreamRing state lock poisoned"))
+        })?;
+
+        let mut segment_bytes =
+            BytesMut::with_capacity(chunks.len() * TS_PACKET_SIZE + TS_PACKET_SIZE * 8);
+
+        // Prepend PAT if present
+        if let Some(ref pat) = state.cached_pat {
+            segment_bytes.put_slice(pat);
+        }
+
+        // Prepend PMT if present
+        if let Some(ref pmt) = state.cached_pmt {
+            segment_bytes.put_slice(pmt);
+        }
+
+        // Prepend SPS / PPS parameter sets if present
+        for sps_pps in &state.cached_sps_pps {
+            segment_bytes.put_slice(sps_pps);
+        }
+
+        // Slice packets starting from start_seq up until the next keyframe
+        let mut first = true;
+        for chunk in chunks {
+            if !first && chunk.is_keyframe {
+                // Next GOP boundary reached! Stop slice here.
+                break;
+            }
+            first = false;
+            segment_bytes.put_slice(&chunk.data);
+        }
+
+        Ok(segment_bytes.freeze())
     }
 
     /// Read stream chunks sequentially starting from a sequence number.

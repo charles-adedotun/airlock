@@ -23,7 +23,7 @@ Self-hosted media consumers and IPTV subscribers face three critical frustration
   - **Rolling 50–200 GB DVR**: Automatically records and indexes watched content (Live and VOD) with zero manual scheduling.
   - **Linux Page-Cache Ejection**: Calls `posix_fadvise(POSIX_FADV_DONTNEED)` after every segment flush so multi-gigabyte streams never monopolize host system RAM.
 * **Strict Single-Upstream Arbiter**: Mathematically guarantees $\le 1$ concurrent upstream connection with an asynchronous teardown barrier and 300ms zapping debounce.
-* **Razor-Edge Sports Target ($\le 2.5\text{s}$)**: Maintains a 1.5s–2.5s lead behind real-world broadcast, with automated $1.05\times$ audio-pitch-preserved catch-up after network jitter.
+* **Razor-Edge Sports Target ($\le 2.5\text{s}$)**: Maintains a 1.5s–2.5s lead behind real-world broadcast, with instant sub-millisecond keyframe leap (`TsStreamRing::get_zapping_burst()`) to the live edge after network jitter without audio pitch distortion or latency lag.
 * **Hardened Security**: Custom `SafeDnsResolver` blocking SSRF pivots into RFC 1918 LANs, cloud metadata, and Tailscale CGNAT (`100.64.0.0/10`), alongside automated URL credential masking.
 
 ---
@@ -51,7 +51,7 @@ cargo build --release
 | Flag | Environment Variable | Default | Description |
 |---|---|---|---|
 | `-l, --listen` | `AIRLOCK_LISTEN` | `0.0.0.0:8795` | Bind address for HTTP gateway |
-| `-u, --upstream` | `AIRLOCK_UPSTREAM` | `http://line.ottcst.org` | Upstream provider base URL |
+| `-u, --upstream` | `AIRLOCK_UPSTREAM` | `http://stream.example.com` | Upstream provider base URL |
 | `-c, --cache-dir` | `AIRLOCK_CACHE_DIR` | `~/.cache/airlock/media` | Storage directory for rolling DVR |
 | `--max-storage-gb` | `AIRLOCK_MAX_STORAGE_GB` | `100` | Rolling cache ceiling (50–200 GB) |
 | `--min-disk-free-gb` | `AIRLOCK_MIN_DISK_FREE_GB` | `10` | Emergency free disk floor |

@@ -145,6 +145,9 @@ impl LineupManager {
 
     /// Generate UPnP `device.xml` for auto-discovery by Plex/Emby/Jellyfin.
     pub fn generate_device_xml(&self) -> String {
+        let base_url = &self.base_url;
+        let friendly_name = &self.friendly_name;
+        let device_id = &self.device_id;
         format!(
             r#"<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -162,10 +165,7 @@ impl LineupManager {
     <serialNumber>{device_id}</serialNumber>
     <UDN>uuid:20261018-0000-0000-0000-{device_id}</UDN>
   </device>
-</root>"#,
-            base_url = self.base_url,
-            friendly_name = self.friendly_name,
-            device_id = self.device_id,
+</root>"#
         )
     }
 
@@ -180,14 +180,10 @@ impl LineupManager {
             let tvg_name = ch.tvg_name.as_deref().unwrap_or(&ch.guide_name);
             let group = ch.group_title.as_deref().unwrap_or("Live TV");
             let logo = ch.tvg_logo.as_deref().unwrap_or("");
+            let name = &ch.guide_name;
 
             m3u.push_str(&format!(
-                r#"#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{tvg_name}" tvg-logo="{logo}" group-title="{group}",{name}"#,
-                tvg_id = tvg_id,
-                tvg_name = tvg_name,
-                logo = logo,
-                group = group,
-                name = ch.guide_name
+                r#"#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{tvg_name}" tvg-logo="{logo}" group-title="{group}",{name}"#
             ));
             m3u.push('\n');
             m3u.push_str(&ch.stream_url);
@@ -207,9 +203,13 @@ async fn handle_discover(
     let mut config = manager.get_discover_json();
     if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
         if config.base_url.contains("://0.0.0.0:") {
-            let schema = if config.base_url.starts_with("https://") { "https://" } else { "http://" };
-            config.base_url = format!("{}{}", schema, host);
-            config.lineup_url = format!("{}{}/lineup.json", schema, host);
+            let schema = if config.base_url.starts_with("https://") {
+                "https://"
+            } else {
+                "http://"
+            };
+            config.base_url = format!("{schema}{host}");
+            config.lineup_url = format!("{schema}{host}/lineup.json");
         }
     }
     Json(config)
@@ -227,10 +227,14 @@ async fn handle_lineup(
     if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
         for ch in &mut channels {
             if ch.stream_url.contains("://0.0.0.0:") {
-                let schema = if ch.stream_url.starts_with("https://") { "https://" } else { "http://" };
+                let schema = if ch.stream_url.starts_with("https://") {
+                    "https://"
+                } else {
+                    "http://"
+                };
                 let rest = &ch.stream_url[schema.len()..];
                 if let Some(slash_idx) = rest.find('/') {
-                    ch.stream_url = format!("{}{}{}", schema, host, &rest[slash_idx..]);
+                    ch.stream_url = format!("{schema}{host}{}", &rest[slash_idx..]);
                 }
             }
         }
@@ -245,11 +249,15 @@ async fn handle_device_xml(
     let mut xml = manager.generate_device_xml();
     if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
         if xml.contains("://0.0.0.0:") {
-            let schema = if xml.contains("https://0.0.0.0:") { "https://" } else { "http://" };
-            if let Some(start) = xml.find(&format!("{}0.0.0.0:", schema)) {
+            let schema = if xml.contains("https://0.0.0.0:") {
+                "https://"
+            } else {
+                "http://"
+            };
+            if let Some(start) = xml.find(&format!("{schema}0.0.0.0:")) {
                 if let Some(end) = xml[start..].find("</URLBase>") {
                     let full_tag = &xml[start..start + end];
-                    xml = xml.replace(full_tag, &format!("{}{}", schema, host));
+                    xml = xml.replace(full_tag, &format!("{schema}{host}"));
                 }
             }
         }
@@ -272,7 +280,11 @@ async fn handle_playlist_m3u(
             let mut result = String::with_capacity(m3u.len());
             for line in m3u.lines() {
                 if line.contains("://0.0.0.0:") {
-                    let schema = if line.starts_with("https://") { "https://" } else { "http://" };
+                    let schema = if line.starts_with("https://") {
+                        "https://"
+                    } else {
+                        "http://"
+                    };
                     let rest = &line[schema.len()..];
                     if let Some(slash_idx) = rest.find('/') {
                         result.push_str(schema);

@@ -161,6 +161,11 @@ impl LiveRingBuffer {
         Ok(None)
     }
 
+    /// Return the oldest sequence number currently in the ring buffer.
+    pub fn oldest_sequence(&self) -> Option<u64> {
+        self.state.read().ok()?.chunks.front().map(|c| c.sequence)
+    }
+
     /// Query current buffer metrics and telemetry.
     pub fn stats(&self) -> Result<RingStats, StorageError> {
         let state = self
