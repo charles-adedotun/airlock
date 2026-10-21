@@ -486,8 +486,9 @@ impl LiveBroadcastHub {
                             Some(Ok(chunk)) => {
                                 stall_started = None;
                                 shield_clone.record_chunk_arrival(chunk.len());
-                                let _ = ring_clone.ingest_raw(&chunk);
-                                let _ = tx_clone.send(chunk);
+                                if let Ok(Some(aligned)) = ring_clone.ingest_raw_aligned(&chunk) {
+                                    let _ = tx_clone.send(aligned);
+                                }
                             }
                             Some(Err(err)) => {
                                 let sanitized_err = RedactedUrl::sanitize_str(&err.to_string());

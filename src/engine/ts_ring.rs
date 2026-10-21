@@ -466,12 +466,23 @@ impl TsStreamRing {
     /// Push raw chunks into the synchronizer, parse TS packets, index keyframes,
     /// and commit chunks to the underlying ring buffer.
     pub fn ingest_raw(&self, data: &[u8]) -> Result<usize, StorageError> {
+        self.ingest_raw_aligned(data)
+            .map(|opt| opt.map(|b| b.len() / TS_PACKET_SIZE).unwrap_or(0))
+    }
+
+    /// Ingest arbitrary raw network data, synchronize 188-byte MPEG-TS packets,
+    /// commit them to the ring buffer, and return the contiguous 188-byte aligned payload.
+    pub fn ingest_raw_aligned(&self, data: &[u8]) -> Result<Option<Bytes>, StorageError> {
         let mut state = self.state.write().map_err(|_| {
             StorageError::Io(std::io::Error::other("TsStreamRing state lock poisoned"))
         })?;
 
         let packets = state.synchronizer.push(data);
-        let count = packets.len();
+        if packets.is_empty() {
+            return Ok(None);
+        }
+
+        let mut aligned_bytes = BytesMut::with_capacity(packets.len() * TS_PACKET_SIZE);
 
         for packet in packets {
             let meta = parse_ts_packet(&packet, state.pmt_pid, state.video_pid);
@@ -498,7 +509,7 @@ impl TsStreamRing {
                     state.cached_sps_pps.push(packet.clone());
                 }
 
-                let seq = self.ring.push(packet, m.is_idr)?;
+                let seq = self.ring.push(packet.clone(), m.is_idr)?;
 
                 if m.is_idr {
                     state.latest_idr_seq = Some(seq);
@@ -511,11 +522,13 @@ impl TsStreamRing {
                     }
                 }
             } else {
-                self.ring.push(packet, false)?;
+                self.ring.push(packet.clone(), false)?;
             }
+
+            aligned_bytes.put_slice(&packet);
         }
 
-        Ok(count)
+        Ok(Some(aligned_bytes.freeze()))
     }
 
     /// Locate a keyframe anchor sequence `target_seconds` in the past (GOP-aligned).

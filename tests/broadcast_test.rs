@@ -9,9 +9,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn test_broadcast_fan_out_guarantees_single_upstream_socket() {
     let mock_server = MockServer::start().await;
 
-    // Upstream sends 188-byte TS dummy chunk
-    let mut dummy_ts = vec![0x47];
-    dummy_ts.resize(188 * 5, 0);
+    // Upstream sends 188-byte TS dummy chunk (valid TS sync byte 0x47 and payload flag 0x10)
+    let mut dummy_ts = Vec::with_capacity(188 * 5);
+    for _ in 0..5 {
+        let mut pkt = [0u8; 188];
+        pkt[0] = 0x47;
+        pkt[3] = 0x10;
+        dummy_ts.extend_from_slice(&pkt);
+    }
 
     Mock::given(method("GET"))
         .and(path("/live/airlock/proxy/ch101.ts"))
@@ -76,9 +81,14 @@ async fn test_broadcast_fan_out_guarantees_single_upstream_socket() {
 async fn test_broadcast_uses_configured_credentials() {
     let mock_server = MockServer::start().await;
 
-    // Upstream sends 188-byte TS dummy chunk
-    let mut dummy_ts = vec![0x47];
-    dummy_ts.resize(188 * 5, 0);
+    // Upstream sends 188-byte TS dummy chunk (valid TS sync byte 0x47 and payload flag 0x10)
+    let mut dummy_ts = Vec::with_capacity(188 * 5);
+    for _ in 0..5 {
+        let mut pkt = [0u8; 188];
+        pkt[0] = 0x47;
+        pkt[3] = 0x10;
+        dummy_ts.extend_from_slice(&pkt);
+    }
 
     // WireMock expects configured credentials in URL path:
     // /live/custom_user_123/custom_pass_xyz/stream99.ts
