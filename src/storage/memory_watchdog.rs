@@ -70,10 +70,10 @@ pub fn parse_vm_stat(content: &str, total_bytes: u64) -> IoResult<HostMemoryInfo
         if line.starts_with("Mach Virtual Memory Statistics:") {
             if let Some(start) = line.find("page size of ") {
                 let rest = &line[start + "page size of ".len()..];
-                if let Some(end) = rest.find(" bytes") {
-                    if let Ok(ps) = rest[..end].trim().parse::<u64>() {
-                        page_size = ps;
-                    }
+                if let Some(end) = rest.find(" bytes")
+                    && let Ok(ps) = rest[..end].trim().parse::<u64>()
+                {
+                    page_size = ps;
                 }
             }
             continue;

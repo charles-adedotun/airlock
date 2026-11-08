@@ -320,7 +320,7 @@ async fn test_chaos_upstream_wan_stall_3s_adaptive_shield_and_null_packets() {
         let mut has_null = false;
         let mut has_media = false;
 
-        for pkt in chunk.chunks_exact(188) {
+        for pkt in chunk.as_chunks::<188>().0 {
             assert_eq!(pkt[0], 0x47, "TS packet must start with sync byte 0x47");
             let pid = (((pkt[1] & 0x1F) as u16) << 8) | (pkt[2] as u16);
 
@@ -427,7 +427,7 @@ async fn test_chaos_upstream_stall_exceeding_8s_clean_teardown() {
         while let Some(res) = sub.next().await {
             let chunk = res.expect("chunk ok during stall");
             assert_eq!(chunk.len() % 188, 0, "Packet alignment preserved");
-            for pkt in chunk.chunks_exact(188) {
+            for pkt in chunk.as_chunks::<188>().0 {
                 assert_eq!(pkt[0], 0x47, "Sync byte preserved");
                 let pid = (((pkt[1] & 0x1F) as u16) << 8) | (pkt[2] as u16);
                 if pid == 0x1FFF {

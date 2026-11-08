@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::unwrap_used)]
+#![allow(clippy::collapsible_if)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod arbiter;

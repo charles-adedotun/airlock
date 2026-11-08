@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::unwrap_used)]
+#![allow(clippy::collapsible_if)]
 
 use std::path::PathBuf;
 use std::pin::Pin;

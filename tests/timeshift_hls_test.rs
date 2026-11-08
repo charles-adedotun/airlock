@@ -269,7 +269,7 @@ fn test_hls_playlist_sliding_window_tags_and_sequence() {
         .with_window_size(3)
         .with_target_duration(6);
 
-    let segments = vec![
+    let segments = [
         HlsSegment::new(10, Duration::from_secs(6), "seg_10.ts"),
         HlsSegment::new(11, Duration::from_secs(6), "seg_11.ts"),
         HlsSegment::new(12, Duration::from_secs(6), "seg_12.ts"),

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all, clippy::unwrap_used)]
+#![allow(clippy::collapsible_if)]
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -348,10 +349,10 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home);
         }
-    } else if let Some(suffix) = path_str.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(suffix);
-        }
+    } else if let Some(suffix) = path_str.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(suffix);
     }
     path.to_path_buf()
 }

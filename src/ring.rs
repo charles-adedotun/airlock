@@ -150,12 +150,11 @@ impl LiveRingBuffer {
             .map_err(|_| StorageError::Io(std::io::Error::other("Ring buffer lock poisoned")))?;
 
         // Verify the keyframe is still in the buffer
-        if let Some(key_seq) = state.latest_keyframe_seq {
-            if let Some(oldest) = state.chunks.front() {
-                if key_seq >= oldest.sequence {
-                    return Ok(Some(key_seq));
-                }
-            }
+        if let Some(key_seq) = state.latest_keyframe_seq
+            && let Some(oldest) = state.chunks.front()
+            && key_seq >= oldest.sequence
+        {
+            return Ok(Some(key_seq));
         }
 
         Ok(None)
